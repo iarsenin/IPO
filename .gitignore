@@ -1,0 +1,31 @@
+.DS_Store
+Icon*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Logs and local data
+*.log
+log/
+charts/
+reports/
+thesis/
+data/*.json
+
+# Environment files (keep .env.example tracked)
+.env
+.env.local
+.env.*.local
+
+# Editor/IDE
+.idea/
+.vscode/
