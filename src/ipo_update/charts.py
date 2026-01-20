@@ -45,10 +45,7 @@ def generate_comparison_chart(
 
     actual_days = (end_date - start_date).days
     if actual_days < request.window_days:
-        if request.purchase_date and pd.to_datetime(request.purchase_date) >= start_date:
-            window_label = "since listing"
-        else:
-            window_label = f"{actual_days}d"
+        window_label = "since listing"
     else:
         window_label = f"{request.window_days}d"
 

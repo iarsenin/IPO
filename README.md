@@ -47,8 +47,11 @@ bash scripts/run_report.sh --no-email
 - `log/ipo_update_YYYYMMDD_HHMMSS.log`
 
 ## Notes
-- IPO lists are cached in `data/` to reduce repeated LLM calls; use `--refresh` to force a new fetch.
+- IPO lists are fetched fresh on each run (snapshots saved to `data/` for debugging).
 - Recommendations use `STRONG BUY / BUY / PASS` and explicitly consider 5x upside potential.
+- Upcoming IPOs without a disclosed price show "—" for recommendation (cannot evaluate without price).
+- Duplicate tickers are automatically de-duplicated (keeps entry with most sources/highest confidence).
+- SPACs and blank-check companies are filtered out.
 
 ## Details
 This project generates a **weekly IPO intelligence email** focused on two distinct pipelines:
@@ -59,25 +62,25 @@ This project generates a **weekly IPO intelligence email** focused on two distin
 - **Local-first**: simple to run on a Mac with minimal dependencies.
 - **Deterministic core logic**: calculation, table rendering, and charting are explicit and repeatable.
 - **LLM used for synthesis**: the model is only used to summarize and reason; it does not drive core calculations.
-- **Cost-aware**: IPO lists and summaries are cached to reduce repeated LLM and API calls.
+- **Fresh data**: IPO lists are fetched fresh each run to ensure accuracy (snapshots saved for debugging).
 - **Audit-friendly**: prompts request citations and store research outputs on disk.
+- **Email-friendly HTML**: table-based layouts (no flexbox) for compatibility with Outlook, Gmail, and Mac Mail.
 
 ### Core workflow
 1. **Fetch IPO lists** using OpenAI with web search:
-   - Recent IPOs: last `RECENT_IPO_WINDOW_DAYS`
-   - Upcoming IPOs: next `UPCOMING_IPO_WINDOW_DAYS`
-   - Sources are suggested but *not limited* (Nasdaq/NYSE calendars, SEC, major media, IR pages, etc.)
-2. **Cache IPO lists** in `data/` to avoid re-fetching unless `--refresh` is used.
-3. **Price & news data** from Alpha Vantage for recent IPO tickers.
-4. **Performance metrics**:
+   - Recent IPOs: last `RECENT_IPO_WINDOW_DAYS` (excludes SPACs, de-duplicates by ticker)
+   - Upcoming IPOs: next `UPCOMING_IPO_WINDOW_DAYS` (checks EDGAR confirmation, excludes SPACs)
+   - Sources: Renaissance Capital, IPO Scoop, SEC EDGAR, Nasdaq/NYSE, Yahoo Finance, MarketWatch
+2. **Price & news data** from Alpha Vantage for recent IPO tickers.
+3. **Performance metrics**:
    - Since IPO date (or first available price if IPO price is missing)
    - 1W / 1M returns where data exists
-5. **Deep-dive profiles** (baseline thesis) using `templates/research_request.md`.
-6. **Executive summaries**:
+4. **Deep-dive profiles** (baseline thesis) using `templates/research_request.md`.
+5. **Concise summaries** (not repetitive "executive summaries"):
    - Recent IPOs: post-IPO performance + targets + recommendation
-   - Upcoming IPOs: participation guidance + targets + recommendation
-7. **Charts**: two per ticker (1M and 6M vs QQQ), with “since listing” fallback.
-8. **Email assembly** with two tables + per-company writeups and inline charts.
+   - Upcoming IPOs: participation guidance + targets (recommendation only if price is known)
+6. **Charts**: two per ticker (1M and 6M vs QQQ), with "since listing" label if shorter.
+7. **Email assembly**: table-based HTML with colored performance indicators and inline charts.
 
 ### Recommendation framework
 Recommendations are intentionally simple and aligned to a **5x potential** lens:

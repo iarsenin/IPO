@@ -1,5 +1,5 @@
 Investment Research Request
-Stock Ticker: <Insert Ticker>
+Company: <Insert Identifier>
 Investment Horizon: 1–2 years
 Risk Preference: High risk/reward
 Audience: Qualified Purchaser

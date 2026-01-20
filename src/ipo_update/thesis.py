@@ -162,9 +162,60 @@ def _load_template(template_path: Path) -> str:
     return template_path.read_text(encoding="utf-8").strip()
 
 
-def _build_baseline_prompt(identifier: str, template: str) -> str:
-    base_prompt = template.replace("<Insert Ticker>", identifier)
-    enhanced_prompt = f"""{base_prompt}
+def build_rich_identifier(
+    ticker: str | None,
+    name: str | None,
+    business_summary: str | None = None,
+) -> str:
+    """Build a clear, disambiguating identifier for LLM prompts.
+    
+    Examples:
+    - With ticker: "MDLN (Medline Inc.)"
+    - No ticker, has summary: "Space Exploration Technologies Corp. — aerospace manufacturer"
+    - No ticker, no summary: "OpenAI, Inc. — [use web search to identify]"
+    """
+    if ticker and name:
+        return f"{ticker} ({name})"
+    if ticker:
+        return ticker
+    if name and business_summary:
+        # Truncate long summaries
+        summary = business_summary[:100].strip()
+        if len(business_summary) > 100:
+            summary = summary.rsplit(" ", 1)[0] + "..."
+        return f"{name} — {summary}"
+    if name:
+        return f"{name} — [use web search to identify this company]"
+    return "Unknown Company"
+
+
+def _build_baseline_prompt(
+    identifier: str,
+    template: str,
+    ticker: str | None = None,
+    name: str | None = None,
+    business_summary: str | None = None,
+) -> str:
+    # Build a rich identifier for the prompt
+    rich_id = build_rich_identifier(ticker, name, business_summary)
+    base_prompt = template.replace("<Insert Identifier>", rich_id)
+    # Fallback for old template format
+    base_prompt = base_prompt.replace("<Insert Ticker>", rich_id)
+    
+    # Add context about what we know
+    context_lines = []
+    if ticker:
+        context_lines.append(f"- Ticker: {ticker}")
+    if name:
+        context_lines.append(f"- Company Name: {name}")
+    if business_summary:
+        context_lines.append(f"- Business: {business_summary}")
+    
+    context_block = ""
+    if context_lines:
+        context_block = "\n\nKNOWN INFORMATION:\n" + "\n".join(context_lines)
+    
+    enhanced_prompt = f"""{base_prompt}{context_block}
 
 CRITICAL: You have access to web search. You MUST use it to find current, real information.
 Suggested sources (not a limit): SEC filings, Nasdaq/NYSE IPO pages, Renaissance Capital, company IR pages,
@@ -218,37 +269,55 @@ def _build_recent_summary_prompt(
         price_info += f"- Current Price: ${current_price:.2f}\n"
     perf_info = ""
     if perf_since_ipo is not None:
-        perf_info += f"- Performance since IPO: {perf_since_ipo:.2%}\n"
+        perf_info += f"- Since IPO: {perf_since_ipo:.2%}\n"
     if return_1w is not None or return_1m is not None:
         parts = []
         if return_1w is not None:
             parts.append(f"{return_1w:.2%} (1W)")
         if return_1m is not None:
             parts.append(f"{return_1m:.2%} (1M)")
-        perf_info += f"- Recent performance: {', '.join(parts)}\n"
+        perf_info += f"- Recent: {', '.join(parts)}\n"
     news_text = "\n".join(
-        f"- {item.get('title')} ({item.get('source')})" for item in news_items[:5]
+        f"- {item.get('title')} ({item.get('source')})" for item in news_items[:3]
     )
-    return f"""Generate a several-paragraph executive summary for a RECENT IPO: {identifier}.
+    return f"""Write a CONCISE writeup for recent IPO: {identifier}.
 
-CONTEXT:
+DATA:
 - IPO Date: {ipo_date or "unknown"}
 {price_info}{perf_info}{targets_info}
-- Deep Dive Profile:
-{baseline}
-
-- Recent News:
 {news_text}
 
-REQUIREMENTS:
-1. Summarize company profile, business model, and IPO thesis (2-3 paragraphs).
-2. Discuss post-IPO performance since pricing and the last month/week if available.
-3. Provide price targets (base/bull/bear) and rationale in plain language.
-4. Make a recommendation using EXACT format: "Decision: STRONG BUY/BUY/PASS".
-5. Explicitly evaluate 5x upside potential; if realistic, explain why.
-6. Mention an entry/participation price level if relevant.
+BASELINE (for reference only—do NOT repeat):
+{baseline[:1500]}{"..." if len(baseline) > 1500 else ""}
 
-Tone: professional, concise, actionable. Cite sources if you used web search."""
+OUTPUT FORMAT (follow this EXACTLY):
+- **What they do**: 1-2 sentences on business model.
+- **Post-IPO**: 2 sentences on price action since listing.
+- **Targets**: Base $X / Bull $Y / Bear $Z — one line each with brief rationale.
+- **5x potential**: One sentence—realistic or not.
+- **Decision**: STRONG BUY / BUY / PASS — state entry price if buying.
+
+EXAMPLE OUTPUT (use this style):
+**What they do**: MDLN distributes medical supplies to hospitals/clinics with sticky relationships and recurring demand.
+
+**Post-IPO**: Up 52% since listing; strong momentum (+9% 1W) suggests buy-side confidence in the cash-flow story.
+
+**Targets**:
+- Base $58: Steady deleveraging + margin stability.
+- Bull $110: Above-trend growth + premium multiple.
+- Bear $28: Margin compression or execution slip.
+
+**5x potential**: Not realistic in 1-2 years without exceptional discontinuity.
+
+**Decision**: BUY — accumulate on pullbacks toward $40-42.
+
+RULES:
+- Do NOT say "Executive Summary" anywhere.
+- Do NOT use numbered sections (1), 2), 3)) — use bullets.
+- Do NOT use markdown headers (###).
+- Bold only key terms (ticker, prices, recommendation), not entire sentences.
+- Use markdown links [text](url) for citations.
+- Keep it under 250 words total."""
 
 
 def _build_upcoming_summary_prompt(
@@ -258,45 +327,137 @@ def _build_upcoming_summary_prompt(
     indicative_price: float | None,
     price_confidence: str | None,
 ) -> str:
-    price_line = f"Indicative price: ${indicative_price:.2f} (confidence: {price_confidence})" if indicative_price else "Indicative price: unknown"
-    return f"""Generate a short executive summary for an UPCOMING IPO: {identifier}.
+    has_price = indicative_price is not None
+    price_line = f"Indicative price: ${indicative_price:.2f} ({price_confidence} confidence)" if has_price else "Price: TBD (not yet disclosed)"
+    
+    decision_instruction = """- **Decision**: STRONG BUY / BUY / PASS — with participation price range.""" if has_price else """- **Decision**: Cannot recommend without price. State what valuation metrics to watch (e.g., "participate only if priced below X times revenue")."""
+    
+    return f"""Write a CONCISE preview for upcoming IPO: {identifier}.
 
-CONTEXT:
-- Expected IPO date: {expected_date or "unknown"}
+DATA:
+- Expected date: {expected_date or "TBD"}
 - {price_line}
-- Deep Dive Profile:
-{baseline}
 
-REQUIREMENTS:
-1. Provide a concise business description (few sentences).
-2. State what makes this IPO interesting or risky.
-3. Provide price targets (base/bull/bear) and rationale.
-4. Recommend whether to participate using EXACT format: "Decision: STRONG BUY/BUY/PASS".
-5. Explicitly evaluate 5x upside potential; if realistic, explain why.
-6. Provide a participation price range if possible, and be clear on confidence.
+BASELINE (for reference only—do NOT repeat):
+{baseline[:1500]}{"..." if len(baseline) > 1500 else ""}
 
-Tone: professional, concise, actionable. Cite sources if you used web search."""
+OUTPUT FORMAT (follow this EXACTLY):
+- **What they do**: 1-2 sentences on business model.
+- **Bull/Bear**: Key upside case vs key risk (2-3 sentences total).
+- **Targets**: Base $X / Bull $Y / Bear $Z — or valuation framework if price unknown.
+- **5x potential**: One sentence.
+{decision_instruction}
+
+EXAMPLE OUTPUT (use this style for upcoming IPO WITH price):
+**What they do**: RIKU operates Japanese restaurants in the US with a scalable franchise model.
+
+**Bull/Bear**: Bull case is proven unit economics + expansion runway; bear case is restaurant execution risk and macro sensitivity.
+
+**Targets**:
+- Base $8: Steady store growth + margin stability.
+- Bull $18: Faster expansion + premium brand multiple.
+- Bear $3: Growth stalls or same-store declines.
+
+**5x potential**: Possible if expansion exceeds expectations, but not base case.
+
+**Decision**: BUY — participate at IPO price ($5) with small sizing; add on execution proof.
+
+EXAMPLE OUTPUT (use this style for upcoming IPO WITHOUT price):
+**What they do**: STUB operates a secondary ticketing marketplace monetizing via fees.
+
+**Bull/Bear**: Bull case is durable marketplace liquidity + operating leverage; bear case is fee regulation and event-cycle volatility.
+
+**Targets**: Use EV/Revenue framework—participate only if priced below 3-4x forward revenue.
+
+**5x potential**: Possible but requires multi-year category leadership proof.
+
+**Decision**: Cannot recommend without price. Participate only if IPO implies reasonable EV/Revenue vs marketplace comps.
+
+RULES:
+- Do NOT say "Executive Summary" anywhere.
+- Do NOT use numbered sections — use bullets.
+- Do NOT use markdown headers (###).
+- Bold only key terms, not entire sentences.
+- Use markdown links [text](url) for citations.
+- Keep it under 200 words total."""
 
 
 def _markdown_to_html(text: str) -> str:
+    """Convert markdown-formatted text to HTML for email display.
+    
+    Handles:
+    - **bold** -> <strong>
+    - *italic* -> <em>
+    - [text](url) -> <a href="url">text</a>
+    - Paragraphs separated by blank lines
+    - #, ##, ###, #### headers
+    - Bullet lists
+    """
     if not text:
         return text
+    
+    # Convert markdown links [text](url) to HTML <a> tags
+    text = re.sub(
+        r'\[([^\]]+)\]\(([^)]+)\)',
+        r'<a href="\2" style="color:#0066cc;text-decoration:none;">\1</a>',
+        text
+    )
+    
+    # Convert **bold** to <strong>
     text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    
+    # Convert *italic* to <em> (but not if part of bold)
     text = re.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"<em>\1</em>", text)
+    
+    # Remove any bare URLs that appear after citations
+    text = re.sub(r'\s*\(\s*https?://[^\s)]+\s*\)', '', text)
+    
+    # Split into paragraphs
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not paragraphs:
         if "\n" in text:
             paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
         else:
             paragraphs = [text.strip()]
+    
     html_paragraphs = []
     for para in paragraphs:
-        if para.startswith("# "):
-            html_paragraphs.append(f"<h3>{para[2:].strip()}</h3>")
-        elif para.startswith("## "):
-            html_paragraphs.append(f"<h4>{para[3:].strip()}</h4>")
+        # Skip paragraphs that are just bare URLs
+        if re.match(r'^https?://\S+$', para.strip()):
+            continue
+        
+        # Handle markdown headers (strip ### from start of line)
+        # Process line by line to handle inline ### headers
+        lines = para.split("\n")
+        processed_lines = []
+        for line in lines:
+            stripped = line.strip()
+            # Remove markdown header prefixes - convert to bold inline instead
+            if stripped.startswith("#### "):
+                processed_lines.append(f"<strong>{stripped[5:].strip()}</strong>")
+            elif stripped.startswith("### "):
+                processed_lines.append(f"<strong>{stripped[4:].strip()}</strong>")
+            elif stripped.startswith("## "):
+                processed_lines.append(f"<strong>{stripped[3:].strip()}</strong>")
+            elif stripped.startswith("# "):
+                processed_lines.append(f"<strong>{stripped[2:].strip()}</strong>")
+            else:
+                processed_lines.append(stripped)
+        para = " ".join(processed_lines)
+        
+        # Handle bullet points
+        if para.startswith("- ") or "\n- " in para:
+            items = [line.strip()[2:] for line in para.split("\n") if line.strip().startswith("- ")]
+            if not items:
+                items = [para[2:].strip()] if para.startswith("- ") else []
+            if items:
+                li_items = "".join(f"<li style=\"margin:4px 0;\">{item}</li>" for item in items)
+                html_paragraphs.append(f"<ul style=\"margin:8px 0;padding-left:20px;\">{li_items}</ul>")
+            else:
+                html_paragraphs.append(f"<p style=\"margin:0 0 12px 0;\">{para}</p>")
         else:
-            html_paragraphs.append(f"<p>{para}</p>")
+            html_paragraphs.append(f"<p style=\"margin:0 0 12px 0;\">{para}</p>")
+    
     return "\n".join(html_paragraphs) if html_paragraphs else f"<p>{text}</p>"
 
 
@@ -306,11 +467,21 @@ def generate_baseline(
     model: str,
     template_path: Path,
     thesis_dir: Path,
+    ticker: str | None = None,
+    name: str | None = None,
+    business_summary: str | None = None,
 ) -> tuple[str | None, Targets | None]:
     logger = get_logger(__name__)
-    logger.info(f"Generating baseline thesis for {identifier}")
+    rich_id = build_rich_identifier(ticker, name, business_summary)
+    logger.info(f"Generating baseline thesis for {rich_id}")
     template = _load_template(template_path)
-    prompt = _build_baseline_prompt(identifier, template)
+    prompt = _build_baseline_prompt(
+        identifier=identifier,
+        template=template,
+        ticker=ticker,
+        name=name,
+        business_summary=business_summary,
+    )
     response = call_responses_with_web_search(client, model, prompt)
     targets = parse_targets_from_response(response.text)
     thesis_text = response.text

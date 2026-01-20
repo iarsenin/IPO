@@ -92,8 +92,12 @@ def fetch_daily_adjusted_batch(
         elapsed = time.monotonic() - last_call
         if elapsed < min_interval:
             time.sleep(min_interval - elapsed)
-        data[symbol] = fetch_daily_adjusted(symbol, api_key, session=session)
-        last_call = time.monotonic()
-        logger.info(f"AlphaVantage batch fetch: {symbol} ({i}/{len(symbols_list)})")
+        try:
+            data[symbol] = fetch_daily_adjusted(symbol, api_key, session=session)
+            logger.info(f"AlphaVantage batch fetch: {symbol} ({i}/{len(symbols_list)})")
+        except Exception as exc:
+            logger.error(f"AlphaVantage batch fetch failed for {symbol} ({i}/{len(symbols_list)}): {exc}")
+        finally:
+            last_call = time.monotonic()
     logger.info(f"AlphaVantage batch fetch completed: {len(data)}/{len(symbols_list)} symbols successful")
     return data

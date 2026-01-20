@@ -47,6 +47,11 @@ def main() -> None:
     parser.add_argument("--recent-window-days", type=int, default=None)
     parser.add_argument("--upcoming-window-days", type=int, default=None)
     parser.add_argument("--refresh", action="store_true", help="Refresh IPO lists even if cache exists")
+    parser.add_argument(
+        "--skip-summaries",
+        action="store_true",
+        help="Skip deep-dive baselines and recommendations (tables only).",
+    )
     parser.add_argument("--no-email", action="store_true", help="Suppress email sending (generate local report only)")
     parser.add_argument("--test-email", action="store_true", help="Send report to EMAIL_TO_TEST instead of EMAIL_TO")
     args = parser.parse_args()
@@ -62,7 +67,7 @@ def main() -> None:
     upcoming_window_days = args.upcoming_window_days or config.upcoming_window_days
 
     if not config.openai_api_key:
-        raise ValueError("OPENAI_API_KEY is required to fetch IPO lists and summaries.")
+        raise ValueError("OPENAI_API_KEY is required to fetch IPO lists.")
     client = build_openai_client(config.openai_api_key)
     if client is None:
         raise RuntimeError("OpenAI client is unavailable.")
@@ -116,22 +121,28 @@ def main() -> None:
         perf = compute_ipo_performance(ipo, series)
 
         identifier = ipo.ticker or ipo.name
-        baseline = load_baseline(thesis_dir, identifier)
-        targets = load_targets(thesis_dir, identifier)
-        if not baseline:
-            try:
-                baseline, targets = generate_baseline(
-                    identifier=identifier,
-                    client=client,
-                    model=config.openai_model,
-                    template_path=template_path,
-                    thesis_dir=thesis_dir,
-                )
-            except Exception as exc:
-                logger.error(f"Baseline generation failed for {identifier}: {exc}")
-                baseline = None
-        if not baseline:
-            baseline = "Baseline thesis generation failed."
+        baseline = None
+        targets = None
+        if not args.skip_summaries:
+            baseline = load_baseline(thesis_dir, identifier)
+            targets = load_targets(thesis_dir, identifier)
+            if not baseline:
+                try:
+                    baseline, targets = generate_baseline(
+                        identifier=identifier,
+                        client=client,
+                        model=config.openai_model,
+                        template_path=template_path,
+                        thesis_dir=thesis_dir,
+                        ticker=ipo.ticker,
+                        name=ipo.name,
+                        business_summary=None,  # Recent IPOs don't have business_summary
+                    )
+                except Exception as exc:
+                    logger.error(f"Baseline generation failed for {identifier}: {exc}")
+                    baseline = None
+            if not baseline:
+                baseline = "Baseline thesis generation failed."
 
         news_items: list[dict] = []
         if ipo.ticker:
@@ -145,25 +156,32 @@ def main() -> None:
                 logger.warning(f"News fetch failed for {ipo.ticker}: {exc}")
                 news_items = []
 
-        try:
-            summary = generate_recent_summary(
+        if args.skip_summaries:
+            summary = ThesisSummary(
                 identifier=identifier,
-                baseline=baseline,
-                targets=targets,
-                client=client,
-                model=config.openai_model,
-                thesis_dir=thesis_dir,
-                ipo_date=ipo.ipo_date.isoformat() if ipo.ipo_date else None,
-                ipo_price=perf.ipo_price,
-                current_price=perf.current_price,
-                perf_since_ipo=perf.perf_since_ipo,
-                return_1w=perf.return_1w,
-                return_1m=perf.return_1m,
-                news_items=news_items,
+                summary="Deep dive skipped for this test run.",
+                updated=False,
             )
-        except Exception as exc:
-            logger.error(f"Summary generation failed for {identifier}: {exc}")
-            summary = ThesisSummary(identifier=identifier, summary=baseline, updated=False)
+        else:
+            try:
+                summary = generate_recent_summary(
+                    identifier=identifier,
+                    baseline=baseline,
+                    targets=targets,
+                    client=client,
+                    model=config.openai_model,
+                    thesis_dir=thesis_dir,
+                    ipo_date=ipo.ipo_date.isoformat() if ipo.ipo_date else None,
+                    ipo_price=perf.ipo_price,
+                    current_price=perf.current_price,
+                    perf_since_ipo=perf.perf_since_ipo,
+                    return_1w=perf.return_1w,
+                    return_1m=perf.return_1m,
+                    news_items=news_items,
+                )
+            except Exception as exc:
+                logger.error(f"Summary generation failed for {identifier}: {exc}")
+                summary = ThesisSummary(identifier=identifier, summary=baseline, updated=False)
 
         recent_summaries[identifier] = summary
         recommendation = extract_recommendation(summary.summary)
@@ -177,6 +195,7 @@ def main() -> None:
                 perf_since_ipo=perf.perf_since_ipo,
                 return_1w=perf.return_1w,
                 return_1m=perf.return_1m,
+                source_quality=ipo.source_quality,
                 recommendation=recommendation,
             )
         )
@@ -213,38 +232,51 @@ def main() -> None:
     for upcoming in upcoming_ipos:
         logger.info(f"Processing upcoming IPO: {upcoming.name} ({upcoming.ticker or 'no ticker'})")
         identifier = upcoming.ticker or upcoming.name
-        baseline = load_baseline(thesis_dir, identifier)
-        targets = load_targets(thesis_dir, identifier)
-        if not baseline:
+        baseline = None
+        targets = None
+        if not args.skip_summaries:
+            baseline = load_baseline(thesis_dir, identifier)
+            targets = load_targets(thesis_dir, identifier)
+            if not baseline:
+                try:
+                    baseline, targets = generate_baseline(
+                        identifier=identifier,
+                        client=client,
+                        model=config.openai_model,
+                        template_path=template_path,
+                        thesis_dir=thesis_dir,
+                        ticker=upcoming.ticker,
+                        name=upcoming.name,
+                        business_summary=upcoming.business_summary,
+                    )
+                except Exception as exc:
+                    logger.error(f"Baseline generation failed for {identifier}: {exc}")
+                    baseline = None
+            if not baseline:
+                baseline = "Baseline thesis generation failed."
+
+        if args.skip_summaries:
+            summary = ThesisSummary(
+                identifier=identifier,
+                summary="Deep dive skipped for this test run.",
+                updated=False,
+            )
+        else:
             try:
-                baseline, targets = generate_baseline(
+                summary = generate_upcoming_summary(
                     identifier=identifier,
+                    baseline=baseline,
+                    targets=targets,
                     client=client,
                     model=config.openai_model,
-                    template_path=template_path,
                     thesis_dir=thesis_dir,
+                    expected_date=upcoming.expected_date,
+                    indicative_price=upcoming.indicative_price,
+                    price_confidence=upcoming.price_confidence,
                 )
             except Exception as exc:
-                logger.error(f"Baseline generation failed for {identifier}: {exc}")
-                baseline = None
-        if not baseline:
-            baseline = "Baseline thesis generation failed."
-
-        try:
-            summary = generate_upcoming_summary(
-                identifier=identifier,
-                baseline=baseline,
-                targets=targets,
-                client=client,
-                model=config.openai_model,
-                thesis_dir=thesis_dir,
-                expected_date=upcoming.expected_date,
-                indicative_price=upcoming.indicative_price,
-                price_confidence=upcoming.price_confidence,
-            )
-        except Exception as exc:
-            logger.error(f"Summary generation failed for {identifier}: {exc}")
-            summary = ThesisSummary(identifier=identifier, summary=baseline, updated=False)
+                logger.error(f"Summary generation failed for {identifier}: {exc}")
+                summary = ThesisSummary(identifier=identifier, summary=baseline, updated=False)
         upcoming_summaries[identifier] = summary
         recommendation = extract_recommendation(summary.summary)
         upcoming_rows.append(
@@ -255,7 +287,11 @@ def main() -> None:
                 price_confidence=upcoming.price_confidence,
                 expected_date=upcoming.expected_date,
                 date_status=upcoming.date_status,
+                date_note=upcoming.date_note,
                 business_summary=upcoming.business_summary,
+                source_quality=upcoming.source_quality,
+                edgar_confirmed=upcoming.edgar_confirmed,
+                edgar_note=upcoming.edgar_note,
                 recommendation=recommendation,
             )
         )
@@ -298,27 +334,7 @@ def main() -> None:
 
 
 def _load_or_fetch_recent(path: Path, client, model: str, window_days: int, refresh: bool):
-    if not refresh:
-        cached = read_json(path)
-        if cached and cached.get("window_days") == window_days:
-            items = cached.get("items", [])
-            if items:
-                logger = get_logger(__name__)
-                logger.info(f"Using cached recent IPO list from {path}")
-                from .ipo_finder import RecentIpo
-                return [
-                    RecentIpo(
-                        name=item.get("name", ""),
-                        ticker=item.get("ticker"),
-                        ipo_date=datetime.fromisoformat(item["ipo_date"]).date() if item.get("ipo_date") else None,
-                        ipo_price=item.get("ipo_price"),
-                        exchange=item.get("exchange"),
-                        sources=item.get("sources", []),
-                    )
-                    for item in items
-                ]
-
-    # Refresh cache when window changes or --refresh is set.
+    # Always fetch fresh lists to avoid hiding data issues.
     recent_ipos = fetch_recent_ipos(client, model, window_days)
     write_json(
         path,
@@ -332,29 +348,7 @@ def _load_or_fetch_recent(path: Path, client, model: str, window_days: int, refr
 
 
 def _load_or_fetch_upcoming(path: Path, client, model: str, window_days: int, refresh: bool):
-    if not refresh:
-        cached = read_json(path)
-        if cached and cached.get("window_days") == window_days:
-            items = cached.get("items", [])
-            if items:
-                logger = get_logger(__name__)
-                logger.info(f"Using cached upcoming IPO list from {path}")
-                from .ipo_finder import UpcomingIpo
-                return [
-                    UpcomingIpo(
-                        name=item.get("name", ""),
-                        ticker=item.get("ticker"),
-                        expected_date=item.get("expected_date"),
-                        date_status=item.get("date_status"),
-                        indicative_price=item.get("indicative_price"),
-                        price_confidence=item.get("price_confidence"),
-                        business_summary=item.get("business_summary"),
-                        sources=item.get("sources", []),
-                    )
-                    for item in items
-                ]
-
-    # Refresh cache when window changes or --refresh is set.
+    # Always fetch fresh lists to avoid hiding data issues.
     upcoming_ipos = fetch_upcoming_ipos(client, model, window_days)
     write_json(
         path,

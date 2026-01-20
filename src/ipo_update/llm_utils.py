@@ -153,10 +153,30 @@ def call_responses_with_web_search(client, model: str, prompt: str) -> LlmRespon
 
 
 def extract_json_block(text: str) -> object | None:
-    """Extract the first JSON object or array from a response string."""
+    """Extract the first JSON object or array from a response string.
+    
+    Handles markdown code fences like ```json ... ``` and raw JSON.
+    """
+    import re
+    
     if not text:
         return None
+    
+    logger = get_logger(__name__)
 
+    # First, try to extract from markdown code fences
+    # Match ```json ... ``` or ``` ... ``` blocks
+    code_fence_pattern = r'```(?:json)?\s*\n?([\s\S]*?)\n?```'
+    matches = re.findall(code_fence_pattern, text)
+    for match in matches:
+        match = match.strip()
+        if match.startswith('{') or match.startswith('['):
+            try:
+                return json.loads(match)
+            except json.JSONDecodeError:
+                continue  # Try next match or fall through to raw extraction
+
+    # Fallback: find raw JSON in text
     # Prefer the earliest JSON-looking block to avoid capturing prose.
     start_obj = text.find("{")
     start_arr = text.find("[")
@@ -179,8 +199,21 @@ def extract_json_block(text: str) -> object | None:
 
     depth = 0
     end = None
+    in_string = False
+    escape_next = False
     for idx in range(start, len(text)):
         ch = text[idx]
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
         if ch == open_char:
             depth += 1
         elif ch == close_char:
@@ -195,7 +228,8 @@ def extract_json_block(text: str) -> object | None:
     raw = text[start:end]
     try:
         return json.loads(raw)
-    except json.JSONDecodeError:
-        logger = get_logger(__name__)
-        logger.warning("Failed to parse JSON block from response")
+    except json.JSONDecodeError as exc:
+        logger.warning(f"Failed to parse JSON block from response: {exc}")
+        # Log first 200 chars of the raw block for debugging
+        logger.debug(f"Raw JSON block (first 200 chars): {raw[:200]}")
         return None
