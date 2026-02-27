@@ -46,26 +46,44 @@ def build_openai_client(api_key: str):
         return None
 
 
-def validate_openai_api_key(client) -> None:
+def validate_openai_api_key(client, model: str) -> None:
     """Verify the API key is valid and the account has credits.
 
-    Makes a tiny chat-completion call (max_tokens=1) so we fail fast instead
-    of discovering a bad key thirty minutes into the run.
+    Makes a tiny chat-completion call (max_tokens=1) using the same model
+    configured in .env so we fail fast instead of discovering a bad key
+    thirty minutes into the run.
 
     Raises
     ------
     SystemExit  if the key is invalid, expired, or the account has no credits.
     """
     logger = get_logger(__name__)
-    logger.info("Validating OpenAI API key …")
+    logger.info(f"Validating OpenAI API key (model={model}) …")
 
     try:
-        # Minimal call to verify authentication and billing.
-        client.chat.completions.create(
-            model="gpt-4o-mini",     # cheapest model; always available
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1,
-        )
+        # Minimal call to verify authentication, billing, and model access.
+        # Use max_completion_tokens (newer models) with max_tokens fallback.
+        try:
+            client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "ping"}],
+                max_completion_tokens=5,
+            )
+        except Exception as inner:
+            inner_msg = str(inner).lower()
+            # "max_completion_tokens" not supported → try legacy parameter
+            if "max_completion_tokens" in inner_msg:
+                client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=5,
+                )
+            # "max_tokens … was reached" → the call ran, meaning auth is fine
+            elif "max_tokens" in inner_msg and "reached" in inner_msg:
+                logger.info("OpenAI API key is valid (model responded, hit token limit as expected).")
+                return
+            else:
+                raise
         logger.info("OpenAI API key is valid and account is funded.")
     except Exception as exc:
         exc_type = type(exc).__name__

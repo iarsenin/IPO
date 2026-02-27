@@ -47,15 +47,10 @@ bash scripts/run_report.sh --no-email
 - `log/ipo_update_YYYYMMDD_HHMMSS.log`
 
 ## Notes
-- On startup the program validates the OpenAI API key and exits immediately if it is invalid or the account has no credits.
 - IPO lists are fetched fresh on each run (snapshots saved to `data/` for debugging).
-- LLM prompts include the current date explicitly so the model knows what "recent" and "upcoming" mean.
-- Transient API errors (rate-limit, network) are retried with exponential back-off (3 attempts).
 - Recommendations use `STRONG BUY / BUY / PASS` and explicitly consider 5x upside potential.
 - Upcoming IPOs without a disclosed price show "—" for recommendation (cannot evaluate without price).
-- Upcoming IPOs whose date has already passed are automatically dropped.
-- Duplicate tickers are automatically de-duplicated (keeps entry with most sources/highest confidence).
-- SPACs and blank-check companies are filtered out.
+- Duplicate tickers are automatically de-duplicated; SPACs and blank-check companies are filtered out.
 
 ## Details
 This project generates a **weekly IPO intelligence email** focused on two distinct pipelines:
@@ -67,12 +62,14 @@ This project generates a **weekly IPO intelligence email** focused on two distin
 - **Deterministic core logic**: calculation, table rendering, and charting are explicit and repeatable.
 - **LLM used for synthesis**: the model is only used to summarize and reason; it does not drive core calculations.
 - **Fresh data**: IPO lists are fetched fresh each run to ensure accuracy (snapshots saved for debugging).
+- **Fail-fast**: API key is validated on startup; auth/billing errors abort immediately instead of producing empty reports.
+- **Resilient**: transient API errors (rate-limit, network, server 5xx) are retried up to 3 times with exponential back-off.
 - **Audit-friendly**: prompts request citations and store research outputs on disk.
 - **Email-friendly HTML**: table-based layouts (no flexbox) for compatibility with Outlook, Gmail, and Mac Mail.
 
 ### Core workflow
-0. **Pre-flight check**: validate the OpenAI API key (a tiny `gpt-4o-mini` call). If it fails, the run aborts immediately with a clear error.
-1. **Fetch IPO lists** using OpenAI with web search:
+0. **Pre-flight check**: validate the OpenAI API key by making a minimal call to the configured model (`OPENAI_MODEL`). If the key is invalid, revoked, or the account has no credits, the run aborts immediately with a clear error message — preventing long runs that produce empty reports.
+1. **Fetch IPO lists** using OpenAI with web search (prompts include today's date explicitly so the model knows the exact window):
    - Recent IPOs: last `RECENT_IPO_WINDOW_DAYS` (excludes SPACs, de-duplicates by ticker)
    - Upcoming IPOs: next `UPCOMING_IPO_WINDOW_DAYS` (checks EDGAR confirmation, excludes SPACs)
    - Sources: Renaissance Capital, IPO Scoop, SEC EDGAR, Nasdaq/NYSE, Yahoo Finance, MarketWatch

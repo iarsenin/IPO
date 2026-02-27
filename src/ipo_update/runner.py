@@ -72,7 +72,7 @@ def main() -> None:
         raise SystemExit("ERROR: Could not create OpenAI client (is the openai package installed?)")
 
     # Pre-flight: verify the key is valid and the account is funded.
-    validate_openai_api_key(client)
+    validate_openai_api_key(client, config.openai_model)
 
     data_dir = Path(args.data_dir)
     recent_cache_path = data_dir / "recent_ipos.json"
