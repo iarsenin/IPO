@@ -22,7 +22,7 @@ from .email_builder import (
     extract_recommendation,
 )
 from .ipo_finder import fetch_recent_ipos, fetch_upcoming_ipos
-from .llm_utils import build_openai_client
+from .llm_utils import build_openai_client, validate_openai_api_key
 from .logger import get_logger, setup_logging
 from .performance import compute_ipo_performance
 from .thesis import (
@@ -46,7 +46,6 @@ def main() -> None:
     parser.add_argument("--log-dir", default="log")
     parser.add_argument("--recent-window-days", type=int, default=None)
     parser.add_argument("--upcoming-window-days", type=int, default=None)
-    parser.add_argument("--refresh", action="store_true", help="Refresh IPO lists even if cache exists")
     parser.add_argument(
         "--skip-summaries",
         action="store_true",
@@ -67,28 +66,29 @@ def main() -> None:
     upcoming_window_days = args.upcoming_window_days or config.upcoming_window_days
 
     if not config.openai_api_key:
-        raise ValueError("OPENAI_API_KEY is required to fetch IPO lists.")
+        raise SystemExit("ERROR: OPENAI_API_KEY is required.  Set it in .env")
     client = build_openai_client(config.openai_api_key)
     if client is None:
-        raise RuntimeError("OpenAI client is unavailable.")
+        raise SystemExit("ERROR: Could not create OpenAI client (is the openai package installed?)")
+
+    # Pre-flight: verify the key is valid and the account is funded.
+    validate_openai_api_key(client)
 
     data_dir = Path(args.data_dir)
     recent_cache_path = data_dir / "recent_ipos.json"
     upcoming_cache_path = data_dir / "upcoming_ipos.json"
 
-    recent_ipos = _load_or_fetch_recent(
+    recent_ipos = _fetch_and_save_recent(
         recent_cache_path,
         client,
         config.openai_model,
         recent_window_days,
-        args.refresh,
     )
-    upcoming_ipos = _load_or_fetch_upcoming(
+    upcoming_ipos = _fetch_and_save_upcoming(
         upcoming_cache_path,
         client,
         config.openai_model,
         upcoming_window_days,
-        args.refresh,
     )
     logger.info(f"Recent IPOs loaded: {len(recent_ipos)}")
     logger.info(f"Upcoming IPOs loaded: {len(upcoming_ipos)}")
@@ -115,8 +115,9 @@ def main() -> None:
     last_av_call = 0.0
     min_interval = 0.2
 
-    for ipo in recent_ipos:
-        logger.info(f"Processing recent IPO: {ipo.name} ({ipo.ticker or 'no ticker'})")
+    total_recent = len(recent_ipos)
+    for idx, ipo in enumerate(recent_ipos, 1):
+        logger.info(f"[{idx}/{total_recent}] Processing recent IPO: {ipo.name} ({ipo.ticker or 'no ticker'})")
         series = series_map.get(ipo.ticker) if ipo.ticker else None
         perf = compute_ipo_performance(ipo, series)
 
@@ -229,8 +230,9 @@ def main() -> None:
 
     upcoming_rows: list[UpcomingIpoRow] = []
     upcoming_summaries: dict[str, ThesisSummary] = {}
-    for upcoming in upcoming_ipos:
-        logger.info(f"Processing upcoming IPO: {upcoming.name} ({upcoming.ticker or 'no ticker'})")
+    total_upcoming = len(upcoming_ipos)
+    for idx, upcoming in enumerate(upcoming_ipos, 1):
+        logger.info(f"[{idx}/{total_upcoming}] Processing upcoming IPO: {upcoming.name} ({upcoming.ticker or 'no ticker'})")
         identifier = upcoming.ticker or upcoming.name
         baseline = None
         targets = None
@@ -316,9 +318,11 @@ def main() -> None:
         recipients = _parse_recipients(email_to)
         if not recipients:
             raise ValueError("Missing EMAIL_TO recipients in environment.")
+        today_str = datetime.now().strftime("%b %d, %Y")
+        subject = f"IPO Weekly Update — {today_str}"
         logger.info(f"Sending email to {', '.join(recipients)}")
         send_email(
-            subject="IPO Weekly Update",
+            subject=subject,
             html=html,
             charts=chart_assets,
             gmail_user=config.gmail_user,
@@ -333,8 +337,8 @@ def main() -> None:
     logger.info("IPO update report generation completed")
 
 
-def _load_or_fetch_recent(path: Path, client, model: str, window_days: int, refresh: bool):
-    # Always fetch fresh lists to avoid hiding data issues.
+def _fetch_and_save_recent(path: Path, client, model: str, window_days: int):
+    """Fetch recent IPOs from LLM and save a snapshot for debugging."""
     recent_ipos = fetch_recent_ipos(client, model, window_days)
     write_json(
         path,
@@ -347,8 +351,8 @@ def _load_or_fetch_recent(path: Path, client, model: str, window_days: int, refr
     return recent_ipos
 
 
-def _load_or_fetch_upcoming(path: Path, client, model: str, window_days: int, refresh: bool):
-    # Always fetch fresh lists to avoid hiding data issues.
+def _fetch_and_save_upcoming(path: Path, client, model: str, window_days: int):
+    """Fetch upcoming IPOs from LLM and save a snapshot for debugging."""
     upcoming_ipos = fetch_upcoming_ipos(client, model, window_days)
     write_json(
         path,

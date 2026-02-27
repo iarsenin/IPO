@@ -185,8 +185,11 @@ def _parse_upcoming_items(items: list[dict]) -> list[UpcomingIpo]:
             if parsed_date.weekday() >= 5 and not date_note:
                 date_note = "Weekend date; verify pricing or first trade date"
         if parsed_date and parsed_date < date.today():
-            if not date_note:
-                date_note = "Date appears in the past; verify"
+            # An "upcoming" IPO with a past date has likely already priced — skip it.
+            get_logger(__name__).debug(
+                f"Dropping upcoming IPO '{name}' — date {parsed_date} is in the past"
+            )
+            continue
         sources = list(item.get("sources", []) or [])
         source_count = len(sources)
         source_quality = "single-source" if source_count <= 1 else "multi-source"
@@ -248,7 +251,10 @@ def fetch_recent_ipos(client, model: str, window_days: int) -> list[RecentIpo]:
     logger = get_logger(__name__)
     cutoff = date.today() - timedelta(days=window_days)
     logger.info(f"Fetching recent IPOs (last {window_days} days, cutoff {cutoff.isoformat()})")
-    prompt = f"""You are building a COMPREHENSIVE list of RECENTLY PRICED US IPOs. Find all IPOs that priced or began trading on or after {cutoff.isoformat()}.
+    today = date.today()
+    prompt = f"""Today's date is {today.isoformat()}.
+
+You are building a COMPREHENSIVE list of RECENTLY PRICED US IPOs. Find all IPOs that priced or began trading on or after {cutoff.isoformat()} and up to {today.isoformat()}.
 
 CRITICAL INSTRUCTIONS:
 - **Search EACH ranked source below and aggregate all unique IPOs.**
@@ -309,8 +315,12 @@ Notes:
 
 def fetch_upcoming_ipos(client, model: str, window_days: int) -> list[UpcomingIpo]:
     logger = get_logger(__name__)
-    logger.info(f"Fetching upcoming IPOs (next {window_days} days)")
-    prompt = f"""You are building a COMPREHENSIVE list of the US IPO pipeline. Include ALL companies that:
+    today = date.today()
+    horizon = today + timedelta(days=window_days)
+    logger.info(f"Fetching upcoming IPOs (next {window_days} days, horizon {horizon.isoformat()})")
+    prompt = f"""Today's date is {today.isoformat()}.
+
+You are building a COMPREHENSIVE list of the US IPO pipeline. Include ALL companies that:
 1. Have announced pricing dates in the next {window_days} days
 2. Have active S-1/F-1 filings and could price soon
 3. Are in roadshow or have effective registration

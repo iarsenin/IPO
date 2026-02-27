@@ -156,6 +156,45 @@ def fetch_recent_news(symbol: str, api_key: str) -> list[dict]:
         raise
 
 
+def _strip_json_block(text: str) -> str:
+    """Remove the first top-level JSON object (the targets block) from the text.
+
+    Returns the remaining prose so we don't accidentally truncate text that
+    appears *after* the JSON block (the old code simply did ``text[:json_start]``).
+    """
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    in_string = False
+    escape_next = False
+    end = None
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                break
+    if end is None:
+        return text[:start].strip()
+    # Remove the JSON block and stitch surrounding text together.
+    return (text[:start].rstrip() + "\n\n" + text[end:].lstrip()).strip()
+
+
 def _load_template(template_path: Path) -> str:
     if not template_path.exists():
         raise FileNotFoundError(f"Research template not found: {template_path}")
@@ -425,39 +464,50 @@ def _markdown_to_html(text: str) -> str:
         # Skip paragraphs that are just bare URLs
         if re.match(r'^https?://\S+$', para.strip()):
             continue
-        
-        # Handle markdown headers (strip ### from start of line)
-        # Process line by line to handle inline ### headers
+
+        # Process line by line — detect bullets & headers BEFORE joining.
         lines = para.split("\n")
-        processed_lines = []
+        bullet_items: list[str] = []
+        non_bullet_lines: list[str] = []
+
         for line in lines:
             stripped = line.strip()
-            # Remove markdown header prefixes - convert to bold inline instead
+            if not stripped:
+                continue
+            # Markdown header → bold inline
             if stripped.startswith("#### "):
-                processed_lines.append(f"<strong>{stripped[5:].strip()}</strong>")
+                stripped = f"<strong>{stripped[5:].strip()}</strong>"
             elif stripped.startswith("### "):
-                processed_lines.append(f"<strong>{stripped[4:].strip()}</strong>")
+                stripped = f"<strong>{stripped[4:].strip()}</strong>"
             elif stripped.startswith("## "):
-                processed_lines.append(f"<strong>{stripped[3:].strip()}</strong>")
+                stripped = f"<strong>{stripped[3:].strip()}</strong>"
             elif stripped.startswith("# "):
-                processed_lines.append(f"<strong>{stripped[2:].strip()}</strong>")
+                stripped = f"<strong>{stripped[2:].strip()}</strong>"
+
+            # Bullet point?
+            if stripped.startswith("- "):
+                bullet_items.append(stripped[2:].strip())
+            elif stripped.startswith("• "):
+                bullet_items.append(stripped[2:].strip())
             else:
-                processed_lines.append(stripped)
-        para = " ".join(processed_lines)
-        
-        # Handle bullet points
-        if para.startswith("- ") or "\n- " in para:
-            items = [line.strip()[2:] for line in para.split("\n") if line.strip().startswith("- ")]
-            if not items:
-                items = [para[2:].strip()] if para.startswith("- ") else []
-            if items:
-                li_items = "".join(f"<li style=\"margin:4px 0;\">{item}</li>" for item in items)
-                html_paragraphs.append(f"<ul style=\"margin:8px 0;padding-left:20px;\">{li_items}</ul>")
-            else:
-                html_paragraphs.append(f"<p style=\"margin:0 0 12px 0;\">{para}</p>")
-        else:
-            html_paragraphs.append(f"<p style=\"margin:0 0 12px 0;\">{para}</p>")
-    
+                # If we were accumulating bullets and hit a non-bullet line,
+                # flush them first.
+                if bullet_items:
+                    li = "".join(f'<li style="margin:4px 0;">{b}</li>' for b in bullet_items)
+                    html_paragraphs.append(f'<ul style="margin:8px 0;padding-left:20px;">{li}</ul>')
+                    bullet_items = []
+                non_bullet_lines.append(stripped)
+
+        # Flush remaining bullets
+        if bullet_items:
+            li = "".join(f'<li style="margin:4px 0;">{b}</li>' for b in bullet_items)
+            html_paragraphs.append(f'<ul style="margin:8px 0;padding-left:20px;">{li}</ul>')
+
+        # Flush remaining non-bullet text
+        if non_bullet_lines:
+            joined = " ".join(non_bullet_lines)
+            html_paragraphs.append(f'<p style="margin:0 0 12px 0;">{joined}</p>')
+
     return "\n".join(html_paragraphs) if html_paragraphs else f"<p>{text}</p>"
 
 
@@ -484,11 +534,7 @@ def generate_baseline(
     )
     response = call_responses_with_web_search(client, model, prompt)
     targets = parse_targets_from_response(response.text)
-    thesis_text = response.text
-    if targets:
-        json_start = response.text.find("{")
-        if json_start != -1:
-            thesis_text = response.text[:json_start].strip()
+    thesis_text = _strip_json_block(response.text) if targets else response.text
     if not thesis_text:
         logger.error(f"Baseline thesis empty for {identifier}")
         return None, None

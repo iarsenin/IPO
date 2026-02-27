@@ -324,23 +324,30 @@ def extract_recommendation(summary: str) -> str:
     """Extract recommendation from summary text. Returns — if no price/can't recommend."""
     if not summary:
         return "—"
-    
-    # Check if this is a "cannot recommend" case (no price)
+
+    # Check if this is a "cannot recommend" case (no price).
     if "cannot recommend" in summary.lower() or "can't recommend" in summary.lower():
         return "—"
-    
-    patterns = [
-        r"Decision:\s*(STRONG BUY|BUY|PASS)",
-        r"Recommendation:\s*(STRONG BUY|BUY|PASS)",
-        r"Action:\s*(STRONG BUY|BUY|PASS)",
+
+    # Prefer structured patterns first (Decision: / Recommendation: / Action:).
+    structured_patterns = [
+        r"(?:\*\*)?Decision(?:\*\*)?[:\s—–-]+\s*(?:\*\*)?(STRONG BUY|BUY|PASS)(?:\*\*)?",
+        r"(?:\*\*)?Recommendation(?:\*\*)?[:\s—–-]+\s*(?:\*\*)?(STRONG BUY|BUY|PASS)(?:\*\*)?",
+        r"(?:\*\*)?Action(?:\*\*)?[:\s—–-]+\s*(?:\*\*)?(STRONG BUY|BUY|PASS)(?:\*\*)?",
     ]
-    for pattern in patterns:
+    for pattern in structured_patterns:
         match = re.search(pattern, summary, re.IGNORECASE)
         if match:
             return match.group(1).upper()
-    match = re.search(r"\b(STRONG BUY|BUY|PASS)\b", summary, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
+
+    # Fallback: match standalone STRONG BUY / BUY / PASS — order matters so
+    # "STRONG BUY" is checked before "BUY" to avoid partial matches.
+    for term in ("STRONG BUY", "PASS", "BUY"):
+        # Word-boundary match; require surrounding non-alpha to avoid matching
+        # inside words like "BUYBACK".
+        pattern = rf"(?<![A-Z]){re.escape(term)}(?![A-Z])"
+        if re.search(pattern, summary, re.IGNORECASE):
+            return term
     return "—"
 
 

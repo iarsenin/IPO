@@ -47,9 +47,13 @@ bash scripts/run_report.sh --no-email
 - `log/ipo_update_YYYYMMDD_HHMMSS.log`
 
 ## Notes
+- On startup the program validates the OpenAI API key and exits immediately if it is invalid or the account has no credits.
 - IPO lists are fetched fresh on each run (snapshots saved to `data/` for debugging).
+- LLM prompts include the current date explicitly so the model knows what "recent" and "upcoming" mean.
+- Transient API errors (rate-limit, network) are retried with exponential back-off (3 attempts).
 - Recommendations use `STRONG BUY / BUY / PASS` and explicitly consider 5x upside potential.
 - Upcoming IPOs without a disclosed price show "—" for recommendation (cannot evaluate without price).
+- Upcoming IPOs whose date has already passed are automatically dropped.
 - Duplicate tickers are automatically de-duplicated (keeps entry with most sources/highest confidence).
 - SPACs and blank-check companies are filtered out.
 
@@ -67,6 +71,7 @@ This project generates a **weekly IPO intelligence email** focused on two distin
 - **Email-friendly HTML**: table-based layouts (no flexbox) for compatibility with Outlook, Gmail, and Mac Mail.
 
 ### Core workflow
+0. **Pre-flight check**: validate the OpenAI API key (a tiny `gpt-4o-mini` call). If it fails, the run aborts immediately with a clear error.
 1. **Fetch IPO lists** using OpenAI with web search:
    - Recent IPOs: last `RECENT_IPO_WINDOW_DAYS` (excludes SPACs, de-duplicates by ticker)
    - Upcoming IPOs: next `UPCOMING_IPO_WINDOW_DAYS` (checks EDGAR confirmation, excludes SPACs)
@@ -101,10 +106,14 @@ scripts/       # run helpers
 
 ### Key modules
 - `src/ipo_update/runner.py`: orchestrates the full pipeline and email send
+- `src/ipo_update/llm_utils.py`: OpenAI client creation, API validation, retry logic, JSON extraction
 - `src/ipo_update/ipo_finder.py`: IPO discovery using OpenAI web search
 - `src/ipo_update/performance.py`: IPO performance metrics
-- `src/ipo_update/thesis.py`: deep-dive generation + summaries + targets
+- `src/ipo_update/thesis.py`: deep-dive generation + summaries + targets + markdown-to-HTML conversion
 - `src/ipo_update/charts.py`: ticker vs QQQ charts
-- `src/ipo_update/email_builder.py`: HTML email composition
+- `src/ipo_update/email_builder.py`: HTML email composition + recommendation extraction
+- `src/ipo_update/data_loader.py`: AlphaVantage API calls + JSON snapshot I/O
+- `src/ipo_update/config.py`: environment config loading
+- `src/ipo_update/logger.py`: logging setup
 
 This section is intended to capture the project’s purpose and rationale so any human or LLM can extend the code without needing external context.

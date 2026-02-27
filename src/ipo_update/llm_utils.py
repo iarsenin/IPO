@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import time
 from dataclasses import dataclass
 
 from .logger import get_logger
+
+# Maximum retries for transient API errors (rate-limit, network, server errors).
+_MAX_RETRIES = 3
+_RETRY_BACKOFF_BASE = 5  # seconds; doubles each retry
 
 
 @dataclass(frozen=True)
@@ -14,6 +19,7 @@ class LlmResponse:
 
 
 def build_openai_client(api_key: str):
+    """Create an OpenAI client.  Returns None if the openai package is missing."""
     if importlib.util.find_spec("openai") is None:
         return None
     from openai import OpenAI
@@ -38,6 +44,68 @@ def build_openai_client(api_key: str):
         logger = get_logger(__name__)
         logger.error(f"Failed to create OpenAI client: {type(exc).__name__} - {str(exc)[:200]}")
         return None
+
+
+def validate_openai_api_key(client) -> None:
+    """Verify the API key is valid and the account has credits.
+
+    Makes a tiny chat-completion call (max_tokens=1) so we fail fast instead
+    of discovering a bad key thirty minutes into the run.
+
+    Raises
+    ------
+    SystemExit  if the key is invalid, expired, or the account has no credits.
+    """
+    logger = get_logger(__name__)
+    logger.info("Validating OpenAI API key …")
+
+    try:
+        # Minimal call to verify authentication and billing.
+        client.chat.completions.create(
+            model="gpt-4o-mini",     # cheapest model; always available
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+        )
+        logger.info("OpenAI API key is valid and account is funded.")
+    except Exception as exc:
+        exc_type = type(exc).__name__
+        exc_msg = str(exc)[:300]
+
+        # Import error types at runtime (openai may not be installed).
+        try:
+            from openai import AuthenticationError, PermissionDeniedError
+        except ImportError:
+            AuthenticationError = PermissionDeniedError = None
+
+        if AuthenticationError and isinstance(exc, AuthenticationError):
+            logger.critical(f"INVALID API KEY: {exc_msg}")
+            raise SystemExit(
+                "ERROR: OpenAI API key is invalid.  "
+                "Check OPENAI_API_KEY in .env and verify the key on https://platform.openai.com/api-keys"
+            ) from exc
+
+        if PermissionDeniedError and isinstance(exc, PermissionDeniedError):
+            logger.critical(f"PERMISSION DENIED (likely no credits): {exc_msg}")
+            raise SystemExit(
+                "ERROR: OpenAI account permission denied (likely insufficient credits).  "
+                "Check billing at https://platform.openai.com/settings/organization/billing/overview"
+            ) from exc
+
+        # Catch quota / billing errors that surface as generic API errors
+        lower_msg = exc_msg.lower()
+        if any(kw in lower_msg for kw in ("insufficient_quota", "billing", "exceeded", "deactivated")):
+            logger.critical(f"BILLING / QUOTA ERROR: {exc_msg}")
+            raise SystemExit(
+                f"ERROR: OpenAI billing/quota problem — {exc_msg}\n"
+                "Top up credits at https://platform.openai.com/settings/organization/billing/overview"
+            ) from exc
+
+        # Any other error during validation is still a showstopper.
+        logger.critical(f"OpenAI API validation failed: {exc_type} — {exc_msg}")
+        raise SystemExit(
+            f"ERROR: Could not validate OpenAI API key ({exc_type}).  "
+            f"Details: {exc_msg}"
+        ) from exc
 
 
 def _extract_citations_from_item(item) -> list[dict]:
@@ -131,25 +199,83 @@ def extract_citations_from_responses(response) -> LlmResponse:
 
 
 def call_responses_with_web_search(client, model: str, prompt: str) -> LlmResponse:
-    logger = get_logger(__name__)
-    if hasattr(client, "responses"):
-        response = client.responses.create(
-            model=model,
-            input=prompt,
-            tools=[{"type": "web_search"}],
-            include=["web_search_call.action.sources"],
-        )
-        result = extract_citations_from_responses(response)
-        logger.info(f"OpenAI Responses API success: {len(result.text)} chars, {len(result.citations)} citations")
-        return result
+    """Call the OpenAI Responses API (with web search) or fall back to Chat Completions.
 
-    logger.warning("Responses API not available, falling back to Chat Completions API (no web search)")
-    completion = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = completion.choices[0].message.content.strip()
-    return LlmResponse(text=text, citations=[])
+    Retries transient errors (rate-limit, server 5xx, network) up to
+    ``_MAX_RETRIES`` times with exponential back-off.  Auth / billing
+    errors are raised immediately so the caller can abort the run.
+    """
+    logger = get_logger(__name__)
+
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            if hasattr(client, "responses"):
+                response = client.responses.create(
+                    model=model,
+                    input=prompt,
+                    tools=[{"type": "web_search"}],
+                    include=["web_search_call.action.sources"],
+                )
+                result = extract_citations_from_responses(response)
+                logger.info(
+                    f"OpenAI Responses API success: {len(result.text)} chars, "
+                    f"{len(result.citations)} citations (attempt {attempt})"
+                )
+                return result
+
+            logger.warning("Responses API not available, falling back to Chat Completions API (no web search)")
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = completion.choices[0].message.content.strip()
+            return LlmResponse(text=text, citations=[])
+
+        except Exception as exc:
+            exc_type = type(exc).__name__
+            exc_msg = str(exc)[:300]
+
+            # Fatal errors — do NOT retry.
+            try:
+                from openai import AuthenticationError, PermissionDeniedError
+            except ImportError:
+                AuthenticationError = PermissionDeniedError = None
+
+            if AuthenticationError and isinstance(exc, AuthenticationError):
+                logger.critical(f"OpenAI authentication failed: {exc_msg}")
+                raise SystemExit(
+                    "ERROR: OpenAI API key is invalid or revoked.  "
+                    "The program cannot continue."
+                ) from exc
+
+            if PermissionDeniedError and isinstance(exc, PermissionDeniedError):
+                logger.critical(f"OpenAI permission denied: {exc_msg}")
+                raise SystemExit(
+                    "ERROR: OpenAI permission denied (likely no credits).  "
+                    "The program cannot continue."
+                ) from exc
+
+            lower_msg = exc_msg.lower()
+            if any(kw in lower_msg for kw in ("insufficient_quota", "billing", "deactivated")):
+                logger.critical(f"OpenAI billing/quota error: {exc_msg}")
+                raise SystemExit(
+                    f"ERROR: OpenAI billing/quota issue — {exc_msg}"
+                ) from exc
+
+            # Transient errors — retry with back-off.
+            if attempt < _MAX_RETRIES:
+                wait = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.warning(
+                    f"OpenAI API error (attempt {attempt}/{_MAX_RETRIES}): "
+                    f"{exc_type} — {exc_msg}.  Retrying in {wait}s …"
+                )
+                time.sleep(wait)
+            else:
+                logger.error(
+                    f"OpenAI API error (attempt {attempt}/{_MAX_RETRIES}): "
+                    f"{exc_type} — {exc_msg}.  Giving up."
+                )
+                raise
 
 
 def extract_json_block(text: str) -> object | None:
