@@ -184,10 +184,10 @@ def _parse_upcoming_items(items: list[dict]) -> list[UpcomingIpo]:
             # Weekend dates are suspicious for IPO pricing; keep but flag.
             if parsed_date.weekday() >= 5 and not date_note:
                 date_note = "Weekend date; verify pricing or first trade date"
-        if parsed_date and parsed_date < date.today():
-            # An "upcoming" IPO with a past date has likely already priced — skip it.
+        if parsed_date and parsed_date <= date.today():
+            # An "upcoming" IPO with today's or a past date has likely already priced.
             get_logger(__name__).debug(
-                f"Dropping upcoming IPO '{name}' — date {parsed_date} is in the past"
+                f"Dropping upcoming IPO '{name}' — date {parsed_date} is today or in the past"
             )
             continue
         sources = list(item.get("sources", []) or [])

@@ -91,6 +91,22 @@ def main() -> None:
         upcoming_window_days,
     )
     logger.info(f"Recent IPOs loaded: {len(recent_ipos)}")
+    logger.info(f"Upcoming IPOs loaded (before dedup): {len(upcoming_ipos)}")
+
+    # Remove upcoming IPOs whose ticker already appears in the recent list
+    # (e.g. a company that just priced appears in both).
+    recent_tickers = {ipo.ticker.upper() for ipo in recent_ipos if ipo.ticker}
+    recent_names = {ipo.name.lower().strip() for ipo in recent_ipos}
+    before = len(upcoming_ipos)
+    upcoming_ipos = [
+        u for u in upcoming_ipos
+        if not (u.ticker and u.ticker.upper() in recent_tickers)
+        and u.name.lower().strip() not in recent_names
+    ]
+    if len(upcoming_ipos) < before:
+        logger.info(
+            f"Removed {before - len(upcoming_ipos)} upcoming IPOs already in recent list"
+        )
     logger.info(f"Upcoming IPOs loaded: {len(upcoming_ipos)}")
 
     tickers = sorted({ipo.ticker for ipo in recent_ipos if ipo.ticker})
