@@ -23,8 +23,13 @@ from .email_builder import (
     build_upcoming_email_html,
     extract_recommendation,
 )
-from .ipo_finder import fetch_recent_ipos, fetch_upcoming_ipos
-from .llm_utils import build_openai_client, validate_openai_api_key
+from .ipo_finder import (
+    fetch_recent_ipos,
+    fetch_upcoming_ipos,
+    parse_recent_snapshot,
+    parse_upcoming_snapshot,
+)
+from .llm_utils import build_openai_client, log_usage_summary, validate_openai_api_key
 from .logger import get_logger, setup_logging
 from .performance import compute_ipo_performance
 from .thesis import (
@@ -79,6 +84,28 @@ def main() -> None:
         action="store_true",
         help="Skip deep-dive baselines and recommendations (tables only).",
     )
+    parser.add_argument(
+        "--force-refresh-summaries",
+        action="store_true",
+        help="Regenerate today's summary updates instead of reusing cached update_YYYYMMDD.md files.",
+    )
+    parser.add_argument(
+        "--limit-recent",
+        type=int,
+        default=None,
+        help="Process only the first N recent IPO rows after discovery/dedup; useful for low-cost test runs.",
+    )
+    parser.add_argument(
+        "--limit-upcoming",
+        type=int,
+        default=None,
+        help="Process only the first N upcoming IPO rows after discovery/dedup; useful for low-cost test runs.",
+    )
+    parser.add_argument(
+        "--use-cached-ipo-lists",
+        action="store_true",
+        help="Use data/recent_ipos.json and data/upcoming_ipos.json instead of running discovery.",
+    )
     parser.add_argument("--no-email", action="store_true", help="Suppress email sending (generate local report only)")
     parser.add_argument("--test-email", action="store_true", help="Send report to EMAIL_TO_TEST instead of EMAIL_TO")
     args = parser.parse_args()
@@ -98,25 +125,54 @@ def main() -> None:
     if client is None:
         raise SystemExit("ERROR: Could not create OpenAI client (is the openai package installed?)")
 
-    # Pre-flight: verify the key is valid and the account is funded.
-    validate_openai_api_key(client, config.openai_model)
+    logger.info(
+        "OpenAI model plan: "
+        f"discovery={config.openai_discovery_model} (web search), "
+        f"discovery_fallback={config.openai_discovery_fallback_model or 'none'}, "
+        f"baseline={config.openai_baseline_model} (web search), "
+        f"summary={config.openai_summary_model} (text only)"
+    )
+
+    # Pre-flight: verify the key is valid, funded, and has access to each model
+    # this run can use.
+    models_to_validate = set()
+    if not args.use_cached_ipo_lists:
+        models_to_validate.add(config.openai_discovery_model)
+        if config.openai_discovery_fallback_model:
+            models_to_validate.add(config.openai_discovery_fallback_model)
+    if not args.skip_summaries:
+        models_to_validate.update(
+            {
+                config.openai_baseline_model,
+                config.openai_summary_model,
+            }
+        )
+    for model in sorted(models_to_validate):
+        validate_openai_api_key(client, model)
 
     data_dir = Path(args.data_dir)
     recent_cache_path = data_dir / "recent_ipos.json"
     upcoming_cache_path = data_dir / "upcoming_ipos.json"
 
-    recent_ipos = _fetch_and_save_recent(
-        recent_cache_path,
-        client,
-        config.openai_model,
-        recent_window_days,
-    )
-    upcoming_ipos = _fetch_and_save_upcoming(
-        upcoming_cache_path,
-        client,
-        config.openai_model,
-        upcoming_window_days,
-    )
+    if args.use_cached_ipo_lists:
+        logger.info("Using cached IPO lists from data directory; discovery skipped")
+        recent_ipos = _load_recent_snapshot(recent_cache_path, recent_window_days)
+        upcoming_ipos = _load_upcoming_snapshot(upcoming_cache_path)
+    else:
+        recent_ipos = _fetch_and_save_recent(
+            recent_cache_path,
+            client,
+            config.openai_discovery_model,
+            config.openai_discovery_fallback_model,
+            recent_window_days,
+        )
+        upcoming_ipos = _fetch_and_save_upcoming(
+            upcoming_cache_path,
+            client,
+            config.openai_discovery_model,
+            config.openai_discovery_fallback_model,
+            upcoming_window_days,
+        )
     logger.info(f"Recent IPOs loaded: {len(recent_ipos)}")
     logger.info(f"Upcoming IPOs loaded (before dedup): {len(upcoming_ipos)}")
 
@@ -134,6 +190,19 @@ def main() -> None:
         logger.info(
             f"Removed {before - len(upcoming_ipos)} upcoming IPOs already in recent list"
         )
+
+    if args.limit_recent is not None:
+        if args.limit_recent < 0:
+            raise ValueError("--limit-recent must be 0 or greater")
+        if len(recent_ipos) > args.limit_recent:
+            logger.info(f"Limiting recent IPO processing to first {args.limit_recent} rows")
+            recent_ipos = recent_ipos[:args.limit_recent]
+    if args.limit_upcoming is not None:
+        if args.limit_upcoming < 0:
+            raise ValueError("--limit-upcoming must be 0 or greater")
+        if len(upcoming_ipos) > args.limit_upcoming:
+            logger.info(f"Limiting upcoming IPO processing to first {args.limit_upcoming} rows")
+            upcoming_ipos = upcoming_ipos[:args.limit_upcoming]
     logger.info(f"Upcoming IPOs loaded: {len(upcoming_ipos)}")
 
     tickers = sorted({ipo.ticker for ipo in recent_ipos if ipo.ticker})
@@ -175,7 +244,7 @@ def main() -> None:
                     baseline, targets = generate_baseline(
                         identifier=identifier,
                         client=client,
-                        model=config.openai_model,
+                        model=config.openai_baseline_model,
                         template_path=template_path,
                         thesis_dir=thesis_dir,
                         ticker=ipo.ticker,
@@ -213,8 +282,9 @@ def main() -> None:
                     baseline=baseline,
                     targets=targets,
                     client=client,
-                    model=config.openai_model,
+                    model=config.openai_summary_model,
                     thesis_dir=thesis_dir,
+                    force_refresh=args.force_refresh_summaries,
                     ipo_date=ipo.ipo_date.isoformat() if ipo.ipo_date else None,
                     ipo_price=perf.ipo_price,
                     current_price=perf.current_price,
@@ -287,7 +357,7 @@ def main() -> None:
                     baseline, targets = generate_baseline(
                         identifier=identifier,
                         client=client,
-                        model=config.openai_model,
+                        model=config.openai_baseline_model,
                         template_path=template_path,
                         thesis_dir=thesis_dir,
                         ticker=upcoming.ticker,
@@ -313,8 +383,9 @@ def main() -> None:
                     baseline=baseline,
                     targets=targets,
                     client=client,
-                    model=config.openai_model,
+                    model=config.openai_summary_model,
                     thesis_dir=thesis_dir,
+                    force_refresh=args.force_refresh_summaries,
                     expected_date=upcoming.expected_date,
                     indicative_price=upcoming.indicative_price,
                     price_confidence=upcoming.price_confidence,
@@ -395,12 +466,19 @@ def main() -> None:
     else:
         logger.info("Email sending suppressed (--no-email flag used)")
 
+    log_usage_summary()
     logger.info("IPO update report generation completed")
 
 
-def _fetch_and_save_recent(path: Path, client, model: str, window_days: int):
+def _fetch_and_save_recent(
+    path: Path,
+    client,
+    model: str,
+    fallback_model: str | None,
+    window_days: int,
+):
     """Fetch recent IPOs from LLM and save a snapshot for debugging."""
-    recent_ipos = fetch_recent_ipos(client, model, window_days)
+    recent_ipos = fetch_recent_ipos(client, model, window_days, fallback_model=fallback_model)
     write_json(
         path,
         {
@@ -412,9 +490,22 @@ def _fetch_and_save_recent(path: Path, client, model: str, window_days: int):
     return recent_ipos
 
 
-def _fetch_and_save_upcoming(path: Path, client, model: str, window_days: int):
+def _load_recent_snapshot(path: Path, window_days: int):
+    """Load recent IPOs from an existing JSON snapshot."""
+    payload = read_json(path)
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    return parse_recent_snapshot(items, window_days)
+
+
+def _fetch_and_save_upcoming(
+    path: Path,
+    client,
+    model: str,
+    fallback_model: str | None,
+    window_days: int,
+):
     """Fetch upcoming IPOs from LLM and save a snapshot for debugging."""
-    upcoming_ipos = fetch_upcoming_ipos(client, model, window_days)
+    upcoming_ipos = fetch_upcoming_ipos(client, model, window_days, fallback_model=fallback_model)
     write_json(
         path,
         {
@@ -424,6 +515,13 @@ def _fetch_and_save_upcoming(path: Path, client, model: str, window_days: int):
         },
     )
     return upcoming_ipos
+
+
+def _load_upcoming_snapshot(path: Path):
+    """Load upcoming IPOs from an existing JSON snapshot."""
+    payload = read_json(path)
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    return parse_upcoming_snapshot(items)
 
 
 def send_email(

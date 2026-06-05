@@ -9,7 +9,7 @@ import re
 import requests
 
 from .logger import get_logger
-from .llm_utils import call_responses_with_web_search, extract_json_block
+from .llm_utils import call_responses_text_only, call_responses_with_web_search, extract_json_block
 
 
 @dataclass(frozen=True)
@@ -154,6 +154,29 @@ def fetch_recent_news(symbol: str, api_key: str) -> list[dict]:
     except requests.RequestException as exc:
         logger.error(f"AlphaVantage API request failed for news {symbol}: {type(exc).__name__} - {str(exc)[:100]}")
         raise
+
+
+def _format_news_items(news_items: list[dict]) -> str:
+    if not news_items:
+        return "- No recent AlphaVantage news items returned."
+
+    lines = []
+    for item in news_items[:3]:
+        title = (item.get("title") or "Untitled").strip()
+        source = (item.get("source") or "unknown source").strip()
+        url = (item.get("url") or "").strip()
+        published = (item.get("time_published") or item.get("published_at") or "").strip()
+        if len(published) >= 8 and published[:8].isdigit():
+            published = f"{published[:4]}-{published[4:6]}-{published[6:8]}"
+        summary = (item.get("summary") or "").strip().replace("\n", " ")
+        if len(summary) > 220:
+            summary = f"{summary[:217].rstrip()}..."
+
+        title_part = f"[{title}]({url})" if url else title
+        date_part = f", {published}" if published else ""
+        summary_part = f": {summary}" if summary else ""
+        lines.append(f"- {title_part} ({source}{date_part}){summary_part}")
+    return "\n".join(lines)
 
 
 def _strip_json_block(text: str) -> str:
@@ -316,18 +339,21 @@ def _build_recent_summary_prompt(
         if return_1m is not None:
             parts.append(f"{return_1m:.2%} (1M)")
         perf_info += f"- Recent: {', '.join(parts)}\n"
-    news_text = "\n".join(
-        f"- {item.get('title')} ({item.get('source')})" for item in news_items[:3]
-    )
+    news_text = _format_news_items(news_items)
     return f"""Write a CONCISE writeup for recent IPO: {identifier}.
 
 DATA:
 - IPO Date: {ipo_date or "unknown"}
 {price_info}{perf_info}{targets_info}
+Recent news from AlphaVantage:
 {news_text}
 
 BASELINE (for reference only—do NOT repeat):
 {baseline[:1500]}{"..." if len(baseline) > 1500 else ""}
+
+FRESHNESS RULE:
+- Use only DATA, Recent news, and BASELINE above. Do not imply you searched for newer facts.
+- If recent news is sparse, say so briefly through the decision/risk wording instead of inventing updates.
 
 OUTPUT FORMAT (follow this EXACTLY):
 - **What they do**: 1-2 sentences on business model.
@@ -355,7 +381,7 @@ RULES:
 - Do NOT use numbered sections (1), 2), 3)) — use bullets.
 - Do NOT use markdown headers (###).
 - Bold only key terms (ticker, prices, recommendation), not entire sentences.
-- Use markdown links [text](url) for citations.
+- Use markdown links [text](url) only when the URL is present in DATA, Recent news, or BASELINE.
 - Keep it under 250 words total."""
 
 
@@ -379,6 +405,10 @@ DATA:
 
 BASELINE (for reference only—do NOT repeat):
 {baseline[:1500]}{"..." if len(baseline) > 1500 else ""}
+
+FRESHNESS RULE:
+- Use only DATA and BASELINE above. Do not imply you searched for newer facts.
+- If the filing/date/pricing picture is incomplete, say what must be confirmed before participating.
 
 OUTPUT FORMAT (follow this EXACTLY):
 - **What they do**: 1-2 sentences on business model.
@@ -417,7 +447,7 @@ RULES:
 - Do NOT use numbered sections — use bullets.
 - Do NOT use markdown headers (###).
 - Bold only key terms, not entire sentences.
-- Use markdown links [text](url) for citations.
+- Use markdown links [text](url) only when the URL is present in DATA or BASELINE.
 - Keep it under 200 words total."""
 
 
@@ -532,7 +562,13 @@ def generate_baseline(
         name=name,
         business_summary=business_summary,
     )
-    response = call_responses_with_web_search(client, model, prompt)
+    response = call_responses_with_web_search(
+        client,
+        model,
+        prompt,
+        task="baseline",
+        label=identifier,
+    )
     targets = parse_targets_from_response(response.text)
     thesis_text = _strip_json_block(response.text) if targets else response.text
     if not thesis_text:
@@ -564,14 +600,17 @@ def generate_recent_summary(
     return_1w: float | None,
     return_1m: float | None,
     news_items: list[dict],
+    force_refresh: bool = False,
 ) -> ThesisSummary:
     existing = load_update(thesis_dir, identifier)
-    if existing:
+    if existing and not force_refresh:
         get_logger(__name__).info(f"Reusing cached summary for {identifier}")
         return ThesisSummary(identifier=identifier, summary=existing, updated=False)
+    if existing and force_refresh:
+        get_logger(__name__).info(f"Force-refreshing cached summary for {identifier}")
 
     logger = get_logger(__name__)
-    logger.info(f"Generating recent IPO summary for {identifier}")
+    logger.info(f"Generating recent IPO summary for {identifier} with text-only model={model}")
     prompt = _build_recent_summary_prompt(
         identifier,
         baseline,
@@ -584,7 +623,14 @@ def generate_recent_summary(
         return_1m,
         news_items,
     )
-    response = call_responses_with_web_search(client, model, prompt)
+    response = call_responses_text_only(
+        client,
+        model,
+        prompt,
+        task="recent_summary",
+        label=identifier,
+        max_output_tokens=700,
+    )
     summary = response.text.strip() or baseline
     save_update(thesis_dir, identifier, summary)
     logger.info(f"Recent IPO summary generated for {identifier} ({len(summary)} chars)")
@@ -601,14 +647,17 @@ def generate_upcoming_summary(
     expected_date: str | None,
     indicative_price: float | None,
     price_confidence: str | None,
+    force_refresh: bool = False,
 ) -> ThesisSummary:
     existing = load_update(thesis_dir, identifier)
-    if existing:
+    if existing and not force_refresh:
         get_logger(__name__).info(f"Reusing cached summary for {identifier}")
         return ThesisSummary(identifier=identifier, summary=existing, updated=False)
+    if existing and force_refresh:
+        get_logger(__name__).info(f"Force-refreshing cached summary for {identifier}")
 
     logger = get_logger(__name__)
-    logger.info(f"Generating upcoming IPO summary for {identifier}")
+    logger.info(f"Generating upcoming IPO summary for {identifier} with text-only model={model}")
     prompt = _build_upcoming_summary_prompt(
         identifier,
         baseline,
@@ -616,7 +665,14 @@ def generate_upcoming_summary(
         indicative_price,
         price_confidence,
     )
-    response = call_responses_with_web_search(client, model, prompt)
+    response = call_responses_text_only(
+        client,
+        model,
+        prompt,
+        task="upcoming_summary",
+        label=identifier,
+        max_output_tokens=650,
+    )
     summary = response.text.strip() or baseline
     save_update(thesis_dir, identifier, summary)
     logger.info(f"Upcoming IPO summary generated for {identifier} ({len(summary)} chars)")

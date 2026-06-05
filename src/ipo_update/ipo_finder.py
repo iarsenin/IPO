@@ -86,6 +86,8 @@ def _normalize_ticker(value: str | None) -> str | None:
     if not value:
         return None
     text = str(value).strip().upper()
+    if text in {"NULL", "NONE", "N/A", "NA", "TBD", "-", "--"}:
+        return None
     return text or None
 
 
@@ -112,6 +114,33 @@ def _normalize_price(value) -> float | None:
         return None
 
 
+def _is_non_operating_ipo(name: str, ipo_type: str) -> bool:
+    normalized_type = ipo_type.replace("-", "_").replace(" ", "_")
+    if normalized_type in {
+        "spac",
+        "blank_check",
+        "blank_check_company",
+        "shell",
+        "shell_company",
+        "unit",
+        "unit_offering",
+        "other",
+    }:
+        return True
+
+    lower_name = name.lower()
+    return any(
+        term in lower_name
+        for term in (
+            "acquisition corp",
+            "acquisition corporation",
+            "blank check",
+            "blank-check",
+            "special purpose acquisition",
+        )
+    )
+
+
 def _parse_recent_items(items: list[dict], cutoff: date) -> list[RecentIpo]:
     parsed: list[RecentIpo] = []
     seen_tickers: dict[str, int] = {}  # ticker -> index in parsed list
@@ -123,7 +152,8 @@ def _parse_recent_items(items: list[dict], cutoff: date) -> list[RecentIpo]:
         if ipo_date and ipo_date < cutoff:
             continue
         ipo_type = str(item.get("type", "")).strip().lower()
-        if ipo_type == "spac":
+        if _is_non_operating_ipo(name, ipo_type):
+            get_logger(__name__).debug(f"Dropping non-operating recent IPO '{name}'")
             continue
         sources = list(item.get("sources", []) or [])
         source_count = len(sources)
@@ -175,7 +205,8 @@ def _parse_upcoming_items(items: list[dict]) -> list[UpcomingIpo]:
         if not name:
             continue
         ipo_type = str(item.get("type", "")).strip().lower()
-        if ipo_type == "spac":
+        if _is_non_operating_ipo(name, ipo_type):
+            get_logger(__name__).debug(f"Dropping non-operating upcoming IPO '{name}'")
             continue
         expected_date = str(item.get("expected_date", "")).strip() or None
         date_note = str(item.get("date_note", "")).strip() or None
@@ -247,7 +278,21 @@ def _parse_upcoming_items(items: list[dict]) -> list[UpcomingIpo]:
     return parsed
 
 
-def fetch_recent_ipos(client, model: str, window_days: int) -> list[RecentIpo]:
+def parse_recent_snapshot(items: list[dict], window_days: int) -> list[RecentIpo]:
+    cutoff = date.today() - timedelta(days=window_days)
+    return _parse_recent_items(items, cutoff)
+
+
+def parse_upcoming_snapshot(items: list[dict]) -> list[UpcomingIpo]:
+    return _parse_upcoming_items(items)
+
+
+def fetch_recent_ipos(
+    client,
+    model: str,
+    window_days: int,
+    fallback_model: str | None = None,
+) -> list[RecentIpo]:
     logger = get_logger(__name__)
     cutoff = date.today() - timedelta(days=window_days)
     logger.info(f"Fetching recent IPOs (last {window_days} days, cutoff {cutoff.isoformat()})")
@@ -303,17 +348,34 @@ Notes:
 - If the date is not verified by sources, exclude the company.
 - Keep sources minimal but credible.
 """
-    response = call_responses_with_web_search(client, model, prompt)
+    response = call_responses_with_web_search(
+        client,
+        model,
+        prompt,
+        task="recent_discovery",
+        label=f"{window_days}d",
+    )
     data = extract_json_block(response.text)
     if not isinstance(data, list):
         logger.warning("Recent IPO list parsing failed; expected JSON array")
+        if fallback_model and fallback_model != model:
+            logger.warning(f"Retrying recent IPO discovery with fallback model={fallback_model}")
+            return fetch_recent_ipos(client, fallback_model, window_days)
         return []
     ipos = _parse_recent_items(data, cutoff)
+    if not ipos and fallback_model and fallback_model != model:
+        logger.warning(f"Recent IPO discovery returned no rows; retrying with fallback model={fallback_model}")
+        return fetch_recent_ipos(client, fallback_model, window_days)
     logger.info(f"Parsed {len(ipos)} recent IPOs from model response")
     return ipos
 
 
-def fetch_upcoming_ipos(client, model: str, window_days: int) -> list[UpcomingIpo]:
+def fetch_upcoming_ipos(
+    client,
+    model: str,
+    window_days: int,
+    fallback_model: str | None = None,
+) -> list[UpcomingIpo]:
     logger = get_logger(__name__)
     today = date.today()
     horizon = today + timedelta(days=window_days)
@@ -380,11 +442,23 @@ Return JSON ONLY (no markdown) with this structure:
   }}
 ]
 """
-    response = call_responses_with_web_search(client, model, prompt)
+    response = call_responses_with_web_search(
+        client,
+        model,
+        prompt,
+        task="upcoming_discovery",
+        label=f"{window_days}d",
+    )
     data = extract_json_block(response.text)
     if not isinstance(data, list):
         logger.warning("Upcoming IPO list parsing failed; expected JSON array")
+        if fallback_model and fallback_model != model:
+            logger.warning(f"Retrying upcoming IPO discovery with fallback model={fallback_model}")
+            return fetch_upcoming_ipos(client, fallback_model, window_days)
         return []
     ipos = _parse_upcoming_items(data)
+    if not ipos and fallback_model and fallback_model != model:
+        logger.warning(f"Upcoming IPO discovery returned no rows; retrying with fallback model={fallback_model}")
+        return fetch_upcoming_ipos(client, fallback_model, window_days)
     logger.info(f"Parsed {len(ipos)} upcoming IPOs from model response")
     return ipos

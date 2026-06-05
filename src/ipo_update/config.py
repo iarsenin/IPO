@@ -7,6 +7,10 @@ class Config:
     alpha_vantage_key: str
     openai_api_key: str | None
     openai_model: str
+    openai_discovery_model: str
+    openai_discovery_fallback_model: str | None
+    openai_baseline_model: str
+    openai_summary_model: str
     gmail_user: str | None
     gmail_app_password: str | None
     email_to: str | None
@@ -34,6 +38,11 @@ def load_config() -> Config:
 
     openai_api_key = getenv("OPENAI_API_KEY", "").strip() or None
     openai_model = getenv("OPENAI_MODEL", "gpt-5.2").strip() or "gpt-5.2"
+    openai_discovery_model = getenv("OPENAI_DISCOVERY_MODEL", openai_model).strip() or openai_model
+    discovery_fallback_raw = getenv("OPENAI_DISCOVERY_FALLBACK_MODEL", openai_model).strip()
+    openai_discovery_fallback_model = discovery_fallback_raw or None
+    openai_baseline_model = getenv("OPENAI_BASELINE_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
+    openai_summary_model = getenv("OPENAI_SUMMARY_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
     gmail_user = getenv("GMAIL_USER", "").strip() or None
     gmail_app_password = getenv("GMAIL_APP_PASSWORD", "").strip() or None
     email_to = getenv("EMAIL_TO", "").strip() or None
@@ -47,6 +56,10 @@ def load_config() -> Config:
         alpha_vantage_key=alpha_vantage_key,
         openai_api_key=openai_api_key,
         openai_model=openai_model,
+        openai_discovery_model=openai_discovery_model,
+        openai_discovery_fallback_model=openai_discovery_fallback_model,
+        openai_baseline_model=openai_baseline_model,
+        openai_summary_model=openai_summary_model,
         gmail_user=gmail_user,
         gmail_app_password=gmail_app_password,
         email_to=email_to,

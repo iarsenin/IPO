@@ -14,7 +14,12 @@ cp .env.example .env
 Fill in `.env`:
 - `ALPHA_VANTAGE_KEY` (required)
 - `OPENAI_API_KEY` (required)
-- `OPENAI_MODEL` (optional; defaults to `gpt-5.2`)
+- OpenAI model controls:
+  - `OPENAI_DISCOVERY_MODEL` (default `OPENAI_MODEL`, normally `gpt-5.2`; uses web search)
+  - `OPENAI_DISCOVERY_FALLBACK_MODEL` (default `OPENAI_MODEL`; used if discovery returns no parseable rows)
+  - `OPENAI_BASELINE_MODEL` (default `gpt-5.4-mini`; uses web search)
+  - `OPENAI_SUMMARY_MODEL` (default `gpt-5.4-mini`; text-only, capped output)
+  - `OPENAI_MODEL` (legacy/global compatibility value; task-specific variables above are preferred)
 - Gmail credentials for email sending:
   - `GMAIL_USER`, `GMAIL_APP_PASSWORD`, `EMAIL_TO`, `EMAIL_TO_TEST`, `EMAIL_FROM`
 - Optional:
@@ -37,6 +42,31 @@ bash scripts/run_report.sh --test-email
 Local-only (no email):
 ```bash
 bash scripts/run_report.sh --no-email
+```
+
+Low-cost smoke test:
+```bash
+bash scripts/run_report.sh --no-email --use-cached-ipo-lists --limit-recent 2 --limit-upcoming 2
+```
+
+## Cost Controls
+The runner separates model usage by task so the expensive freshness work stays targeted:
+- **Discovery**: `OPENAI_DISCOVERY_MODEL` uses web search to find current priced/upcoming IPOs. Keep this on the strongest reliable model because an empty or incomplete list affects the whole report.
+- **Baseline research**: `OPENAI_BASELINE_MODEL` uses web search only when a company has no cached `baseline.md`.
+- **Summary refreshes**: `OPENAI_SUMMARY_MODEL` does not use web search. It summarizes the cached baseline, current price/performance data, targets, and Alpha Vantage news already provided in the prompt.
+
+Each OpenAI call logs `task`, `model`, token counts, web-search call count, and estimated dollars in `~/Library/Logs/IPO/ipo_update_*.log`. At the end of each run, the log includes an aggregate cost summary by task/model.
+
+Useful low-cost modes:
+```bash
+# Rebuild reports from cached discovery data; no IPO discovery search.
+bash scripts/run_report.sh --no-email --use-cached-ipo-lists
+
+# Re-test a small slice of the report.
+bash scripts/run_report.sh --no-email --use-cached-ipo-lists --limit-recent 2 --limit-upcoming 2
+
+# Force today's summaries to regenerate while keeping discovery cached.
+bash scripts/run_report.sh --no-email --use-cached-ipo-lists --force-refresh-summaries
 ```
 
 ## Outputs
@@ -72,12 +102,14 @@ Both emails include in-page navigation: tickers in the summary table are hyperli
 - **Fresh data**: IPO lists are fetched fresh each run to ensure accuracy (snapshots saved for debugging).
 - **Fail-fast**: API key is validated on startup; auth/billing errors abort immediately instead of producing empty reports.
 - **Resilient**: transient API errors (rate-limit, network, server 5xx) are retried up to 3 times with exponential back-off.
-- **Audit-friendly**: prompts request citations and store research outputs on disk.
+- **Cost-aware**: discovery and baseline research use web search; daily summary refreshes use the supplied data/news/baseline with a text-only model call. Logs include token counts, web-search calls, and estimated dollars by task/model.
+- **Cheap reruns**: `--use-cached-ipo-lists` skips discovery and rebuilds reports from `data/*.json`.
+- **Audit-friendly**: prompts request citations where source URLs are available and store research outputs on disk.
 - **Email-friendly HTML**: table-based layouts (no flexbox) for compatibility with Outlook, Gmail, and Mac Mail.
 
 ### Core workflow
-0. **Pre-flight check**: validate the OpenAI API key by making a minimal call to the configured model (`OPENAI_MODEL`). If the key is invalid, revoked, or the account has no credits, the run aborts immediately with a clear error message — preventing long runs that produce empty reports.
-1. **Fetch IPO lists** using OpenAI with web search (prompts include today's date explicitly so the model knows the exact window):
+0. **Pre-flight check**: validate the OpenAI API key by making a minimal call to each configured task model. If the key is invalid, revoked, or the account has no credits, the run aborts immediately with a clear error message — preventing long runs that produce empty reports.
+1. **Fetch IPO lists** using OpenAI with web search (`OPENAI_DISCOVERY_MODEL`; prompts include today's date explicitly so the model knows the exact window):
    - Recent IPOs: last `RECENT_IPO_WINDOW_DAYS` (excludes SPACs, de-duplicates by ticker)
    - Upcoming IPOs: next `UPCOMING_IPO_WINDOW_DAYS` (checks EDGAR confirmation, excludes SPACs)
    - Sources: Renaissance Capital, IPO Scoop, SEC EDGAR, Nasdaq/NYSE, Yahoo Finance, MarketWatch
@@ -85,8 +117,8 @@ Both emails include in-page navigation: tickers in the summary table are hyperli
 3. **Performance metrics**:
    - Since IPO date (or first available price if IPO price is missing)
    - 1W / 1M returns where data exists
-4. **Deep-dive profiles** (baseline thesis) using `templates/research_request.md`.
-5. **Concise summaries** (not repetitive "executive summaries"):
+4. **Deep-dive profiles** (baseline thesis) using `templates/research_request.md` and `OPENAI_BASELINE_MODEL` with web search.
+5. **Concise summaries** (not repetitive "executive summaries") using `OPENAI_SUMMARY_MODEL` without web search:
    - Recent IPOs: post-IPO performance + targets + recommendation
    - Upcoming IPOs: participation guidance + targets (recommendation only if price is known)
 6. **Charts**: two per ticker (1M and 6M vs QQQ), with "since listing" label if shorter.
@@ -111,7 +143,7 @@ scripts/       # run helpers
 
 ### Key modules
 - `src/ipo_update/runner.py`: orchestrates the full pipeline and email send
-- `src/ipo_update/llm_utils.py`: OpenAI client creation, API validation, retry logic, JSON extraction
+- `src/ipo_update/llm_utils.py`: OpenAI client creation, API validation, retry logic, usage/cost logging, JSON extraction
 - `src/ipo_update/ipo_finder.py`: IPO discovery using OpenAI web search
 - `src/ipo_update/performance.py`: IPO performance metrics
 - `src/ipo_update/thesis.py`: deep-dive generation + summaries + targets + markdown-to-HTML conversion
