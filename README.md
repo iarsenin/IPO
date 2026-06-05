@@ -1,16 +1,13 @@
 # IPO
 
-Local, Mac-first system that generates a **weekly IPO email** with:
-- Recent IPO performance (last N days, default 90)
-- Deep-dive profiles and executive summaries (OpenAI with web search)
-- Upcoming IPO pipeline with recommendations and targets
-- Charts per ticker (1M and 6M vs QQQ)
+Local, Mac-first system that generates **two weekly IPO emails**:
+- **Priced IPOs** — recent performance, deep-dive profiles, and recommendations (last N days, default 90)
+- **Expected IPOs** — upcoming pipeline with pre-IPO summaries, targets, and participation guidance
+
+Each email includes clickable tickers in the summary table that jump to the detailed analysis, with a "↑ Back to top" link on every card. Charts (1M and 6M vs QQQ) are included in the Priced IPOs email.
 
 ## Quick start
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 cp .env.example .env
 ```
 
@@ -24,6 +21,8 @@ Fill in `.env`:
   - `RECENT_IPO_WINDOW_DAYS` (default 90)
   - `UPCOMING_IPO_WINDOW_DAYS` (default 90)
   - `TIMEZONE` (default `America/Los_Angeles`)
+  - `IPO_LOG_DIR` (default `~/Library/Logs/IPO`)
+  - `IPO_LOG_RETENTION_DAYS` (default 30; set to 0 to disable cleanup)
 
 Run:
 ```bash
@@ -41,10 +40,17 @@ bash scripts/run_report.sh --no-email
 ```
 
 ## Outputs
-- `reports/ipo_update_YYYYMMDD.html`
+- `reports/ipo_update_priced_YYYYMMDD.html` — Priced IPOs email
+- `reports/ipo_update_expected_YYYYMMDD.html` — Expected IPOs email
 - `charts/*.png`
 - `thesis/<IDENTIFIER>/baseline.md` and `update_YYYYMMDD.md`
-- `log/ipo_update_YYYYMMDD_HHMMSS.log`
+- `~/Library/Logs/IPO/ipo_update_YYYYMMDD_HHMMSS.log`
+
+## Local runtime
+The code can live in Google Drive and sync across machines. The run helper keeps machine-specific runtime files local:
+- Python dependencies are installed into `~/.venvs/ipo` by default and refreshed when `requirements.txt` changes.
+- Set `IPO_VENV=/path/to/venv` in your shell to use a different local virtualenv.
+- Logs default to `~/Library/Logs/IPO` and old `ipo_update_*.log` files are deleted after 30 days.
 
 ## Notes
 - IPO lists are fetched fresh on each run (snapshots saved to `data/` for debugging).
@@ -53,9 +59,11 @@ bash scripts/run_report.sh --no-email
 - Duplicate tickers are automatically de-duplicated; SPACs and blank-check companies are filtered out.
 
 ## Details
-This project generates a **weekly IPO intelligence email** focused on two distinct pipelines:
-1. **Recent IPOs (default last 3 months)**: identify newly priced IPOs, build a deep‑dive profile, analyze post‑IPO performance, and produce an executive summary with targets and a recommendation.
-2. **Upcoming IPOs (default next 3 months)**: identify likely upcoming offerings, research each company, and deliver a concise pre‑IPO summary with indicative pricing and participation guidance.
+This project generates **two weekly IPO intelligence emails**, one per pipeline:
+1. **Priced IPOs (default last 3 months)**: identify newly priced IPOs, build a deep‑dive profile, analyze post‑IPO performance, and produce an executive summary with targets and a recommendation.
+2. **Expected IPOs (default next 3 months)**: identify likely upcoming offerings, research each company, and deliver a concise pre‑IPO summary with indicative pricing and participation guidance.
+
+Both emails include in-page navigation: tickers in the summary table are hyperlinks that jump directly to that company's detailed analysis card, and each card has a "↑ Back to top" link.
 
 ### Design goals
 - **Local-first**: simple to run on a Mac with minimal dependencies.
@@ -82,7 +90,7 @@ This project generates a **weekly IPO intelligence email** focused on two distin
    - Recent IPOs: post-IPO performance + targets + recommendation
    - Upcoming IPOs: participation guidance + targets (recommendation only if price is known)
 6. **Charts**: two per ticker (1M and 6M vs QQQ), with "since listing" label if shorter.
-7. **Email assembly**: table-based HTML with colored performance indicators and inline charts.
+7. **Email assembly**: two separate HTML emails — Priced IPOs (with inline charts) and Expected IPOs. Each has a summary table with clickable ticker anchors and per-company detail cards with "↑ Back to top" navigation.
 
 ### Recommendation framework
 Recommendations are intentionally simple and aligned to a **5x potential** lens:

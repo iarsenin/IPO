@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -22,10 +22,32 @@ class StreamToLogger:
         pass
 
 
-def setup_logging(log_dir: Path | str = "log") -> logging.Logger:
+def cleanup_old_logs(log_dir: Path | str, retention_days: int = 30) -> int:
+    """Delete IPO update logs older than the retention window."""
+    if retention_days <= 0:
+        return 0
+
+    log_dir = Path(log_dir).expanduser()
+    if not log_dir.exists():
+        return 0
+
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    deleted = 0
+    for path in log_dir.glob("ipo_update_*.log"):
+        try:
+            if path.is_file() and datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
+                path.unlink()
+                deleted += 1
+        except OSError:
+            continue
+    return deleted
+
+
+def setup_logging(log_dir: Path | str = "log", retention_days: int = 30) -> logging.Logger:
     """Configure logging with date-based file and stdout/stderr capture."""
-    log_dir = Path(log_dir)
+    log_dir = Path(log_dir).expanduser()
     log_dir.mkdir(parents=True, exist_ok=True)
+    deleted_logs = cleanup_old_logs(log_dir, retention_days)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"ipo_update_{timestamp}.log"
@@ -49,6 +71,10 @@ def setup_logging(log_dir: Path | str = "log") -> logging.Logger:
     sys.stderr = stderr_logger
 
     root_logger.info(f"Logging initialized: {log_file}")
+    if deleted_logs:
+        root_logger.info(
+            f"Cleaned up {deleted_logs} log files older than {retention_days} days in {log_dir}"
+        )
     return root_logger
 
 

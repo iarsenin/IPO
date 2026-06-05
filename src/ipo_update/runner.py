@@ -5,6 +5,7 @@ from datetime import datetime
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from os import getenv
 from pathlib import Path
 import smtplib
 import time
@@ -18,7 +19,8 @@ from .email_builder import (
     ChartAsset,
     RecentIpoRow,
     UpcomingIpoRow,
-    build_email_html,
+    build_recent_email_html,
+    build_upcoming_email_html,
     extract_recommendation,
 )
 from .ipo_finder import fetch_recent_ipos, fetch_upcoming_ipos
@@ -36,14 +38,40 @@ from .thesis import (
 )
 
 
+DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / "IPO"
+
+
+def _get_env_str(name: str, default: str) -> str:
+    raw = getenv(name, "").strip()
+    return raw or default
+
+
+def _get_env_int(name: str, default: int) -> int:
+    raw = getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
 def main() -> None:
+    load_dotenv()
+
     parser = argparse.ArgumentParser(description="Generate weekly IPO update email.")
     parser.add_argument("--reports-dir", default="reports")
     parser.add_argument("--charts-dir", default="charts")
     parser.add_argument("--thesis-dir", default="thesis")
     parser.add_argument("--template-path", default="templates/research_request.md")
     parser.add_argument("--data-dir", default="data")
-    parser.add_argument("--log-dir", default="log")
+    parser.add_argument("--log-dir", default=_get_env_str("IPO_LOG_DIR", str(DEFAULT_LOG_DIR)))
+    parser.add_argument(
+        "--log-retention-days",
+        type=int,
+        default=_get_env_int("IPO_LOG_RETENTION_DAYS", 30),
+        help="Delete IPO logs older than this many days before each run; set to 0 to disable.",
+    )
     parser.add_argument("--recent-window-days", type=int, default=None)
     parser.add_argument("--upcoming-window-days", type=int, default=None)
     parser.add_argument(
@@ -55,11 +83,10 @@ def main() -> None:
     parser.add_argument("--test-email", action="store_true", help="Send report to EMAIL_TO_TEST instead of EMAIL_TO")
     args = parser.parse_args()
 
-    setup_logging(log_dir=args.log_dir)
+    setup_logging(log_dir=args.log_dir, retention_days=args.log_retention_days)
     logger = get_logger(__name__)
     logger.info("Starting IPO update report generation")
 
-    load_dotenv()
     config = load_config()
 
     recent_window_days = args.recent_window_days or config.recent_window_days
@@ -314,18 +341,25 @@ def main() -> None:
             )
         )
 
-    html = build_email_html(
+    recent_html = build_recent_email_html(
         recent_rows=recent_rows,
-        upcoming_rows=upcoming_rows,
         recent_summaries=recent_summaries,
-        upcoming_summaries=upcoming_summaries,
         charts=chart_assets,
     )
+    upcoming_html = build_upcoming_email_html(
+        upcoming_rows=upcoming_rows,
+        upcoming_summaries=upcoming_summaries,
+    )
+
     reports_dir = Path(args.reports_dir)
     reports_dir.mkdir(parents=True, exist_ok=True)
-    report_path = reports_dir / f"ipo_update_{datetime.now().strftime('%Y%m%d')}.html"
-    report_path.write_text(html, encoding="utf-8")
-    logger.info(f"Report saved to {report_path}")
+    date_str = datetime.now().strftime("%Y%m%d")
+    recent_report_path = reports_dir / f"ipo_update_priced_{date_str}.html"
+    upcoming_report_path = reports_dir / f"ipo_update_expected_{date_str}.html"
+    recent_report_path.write_text(recent_html, encoding="utf-8")
+    logger.info(f"Priced IPOs report saved to {recent_report_path}")
+    upcoming_report_path.write_text(upcoming_html, encoding="utf-8")
+    logger.info(f"Expected IPOs report saved to {upcoming_report_path}")
 
     if not args.no_email:
         email_to = config.email_to_test if args.test_email else config.email_to
@@ -335,18 +369,29 @@ def main() -> None:
         if not recipients:
             raise ValueError("Missing EMAIL_TO recipients in environment.")
         today_str = datetime.now().strftime("%b %d, %Y")
-        subject = f"IPO Weekly Update — {today_str}"
-        logger.info(f"Sending email to {', '.join(recipients)}")
+        logger.info(f"Sending emails to {', '.join(recipients)}")
+
         send_email(
-            subject=subject,
-            html=html,
+            subject=f"IPO Update — Priced IPOs — {today_str}",
+            html=recent_html,
             charts=chart_assets,
             gmail_user=config.gmail_user,
             gmail_app_password=config.gmail_app_password,
             email_to=recipients,
             email_from=config.email_from,
         )
-        logger.info("Email sent successfully")
+        logger.info("Priced IPOs email sent successfully")
+
+        send_email(
+            subject=f"IPO Update — Expected IPOs — {today_str}",
+            html=upcoming_html,
+            charts=[],
+            gmail_user=config.gmail_user,
+            gmail_app_password=config.gmail_app_password,
+            email_to=recipients,
+            email_from=config.email_from,
+        )
+        logger.info("Expected IPOs email sent successfully")
     else:
         logger.info("Email sending suppressed (--no-email flag used)")
 

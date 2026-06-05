@@ -16,6 +16,7 @@ env/
 # Logs and local data
 *.log
 log/
+nohup.out
 charts/
 reports/
 thesis/
