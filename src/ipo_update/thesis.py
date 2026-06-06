@@ -12,6 +12,30 @@ from .logger import get_logger
 from .llm_utils import call_responses_text_only, call_responses_with_web_search, extract_json_block
 
 
+_COMPANY_SUFFIX_WORDS = {
+    "ag",
+    "bv",
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "gmbh",
+    "group",
+    "holding",
+    "holdings",
+    "inc",
+    "incorporated",
+    "limited",
+    "llc",
+    "ltd",
+    "nv",
+    "pbc",
+    "plc",
+    "pty",
+    "sa",
+}
+
+
 @dataclass(frozen=True)
 class ThesisSummary:
     identifier: str
@@ -81,6 +105,49 @@ def save_update(thesis_dir: Path, identifier: str, content: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def normalize_company_name(value: str | None) -> str:
+    if not value:
+        return ""
+    normalized = re.sub(r"&", " and ", value.lower())
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    words = [word for word in normalized.split() if word not in _COMPANY_SUFFIX_WORDS]
+    return " ".join(words)
+
+
+def find_cached_identifier(
+    thesis_dir: Path,
+    identifier: str,
+    name: str | None = None,
+) -> str | None:
+    exact = thesis_dir / identifier / "baseline.md"
+    if exact.exists():
+        return identifier
+
+    wanted = {
+        key for key in (normalize_company_name(identifier), normalize_company_name(name)) if len(key) >= 4
+    }
+    if not wanted or not thesis_dir.exists():
+        return None
+
+    baseline_dirs = sorted(
+        path for path in thesis_dir.iterdir()
+        if path.is_dir() and (path / "baseline.md").exists()
+    )
+    for path in baseline_dirs:
+        if normalize_company_name(path.name) in wanted:
+            return path.name
+
+    for path in baseline_dirs:
+        try:
+            sample = (path / "baseline.md").read_text(encoding="utf-8", errors="ignore")[:2500]
+        except OSError:
+            continue
+        sample_key = normalize_company_name(sample)
+        if any(key in sample_key for key in wanted):
+            return path.name
+    return None
 
 
 def load_targets(thesis_dir: Path, identifier: str) -> Targets | None:
@@ -176,6 +243,61 @@ def _format_news_items(news_items: list[dict]) -> str:
         date_part = f", {published}" if published else ""
         summary_part = f": {summary}" if summary else ""
         lines.append(f"- {title_part} ({source}{date_part}){summary_part}")
+    return "\n".join(lines)
+
+
+def _clean_baseline_context(baseline: str, max_chars: int = 8500) -> str:
+    text = re.sub(r"```json[\s\S]*?```", "", baseline, flags=re.IGNORECASE).strip()
+    text = _strip_json_block(text)
+    text = re.sub(
+        r"(?is)\n\s*(if you want|next,?\s+i can|i can next)\b.*$",
+        "",
+        text,
+    ).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if len(text) > max_chars:
+        return f"{text[:max_chars].rstrip()}..."
+    return text
+
+
+def _format_targets_context(targets: Targets | None) -> str:
+    if not targets:
+        return (
+            "No parsed numeric targets are available. Use the cached baseline's "
+            "valuation discussion; if IPO pricing is missing, use EV/Revenue, "
+            "EV/EBITDA, dilution, balance-sheet, or peer-multiple conditions "
+            "instead of unsupported share-price targets."
+        )
+
+    lines = [
+        (
+            f"Parsed target levels: Base ${targets.base_target:.2f}; "
+            f"Bull ${targets.bull_target:.2f}; Bear ${targets.bear_target:.2f}."
+        )
+    ]
+    for scenario in ("base", "bull", "bear"):
+        rationale = (targets.target_rationale or {}).get(scenario)
+        if rationale:
+            lines.append(f"{scenario.title()} rationale: {rationale}")
+    if targets.key_metrics:
+        metrics = []
+        for metric in targets.key_metrics[:4]:
+            name = metric.get("metric")
+            current = metric.get("current_value")
+            target = metric.get("target")
+            if name:
+                metrics.append(f"{name}: {current or 'unknown'} -> {target or 'watch'}")
+        if metrics:
+            lines.append(f"Key metrics: {'; '.join(metrics)}")
+    if targets.watchlist:
+        events = []
+        for item in targets.watchlist[:3]:
+            event = item.get("event")
+            expected = item.get("expected_date")
+            if event:
+                events.append(f"{event} ({expected or 'date TBD'})")
+        if events:
+            lines.append(f"Watchlist: {'; '.join(events)}")
     return "\n".join(lines)
 
 
@@ -340,7 +462,13 @@ def _build_recent_summary_prompt(
             parts.append(f"{return_1m:.2%} (1M)")
         perf_info += f"- Recent: {', '.join(parts)}\n"
     news_text = _format_news_items(news_items)
-    return f"""Write a CONCISE writeup for recent IPO: {identifier}.
+    targets_context = _format_targets_context(targets)
+    baseline_context = _clean_baseline_context(baseline)
+    return f"""Write a concise but substantive IPO investment brief for recent IPO: {identifier}.
+
+Use ONLY the provided data, recent news, target context, and cached baseline. Do not imply fresh web research.
+Prefer specific operating drivers over generic phrases. Current DATA overrides any older price/date/context in the
+baseline; if the baseline references a stale close or entry level, treat it as historical context only.
 
 DATA:
 - IPO Date: {ipo_date or "unknown"}
@@ -348,107 +476,77 @@ DATA:
 Recent news from AlphaVantage:
 {news_text}
 
-BASELINE (for reference only—do NOT repeat):
-{baseline[:1500]}{"..." if len(baseline) > 1500 else ""}
+TARGET CONTEXT:
+{targets_context}
 
-FRESHNESS RULE:
-- Use only DATA, Recent news, and BASELINE above. Do not imply you searched for newer facts.
-- If recent news is sparse, say so briefly through the decision/risk wording instead of inventing updates.
+CACHED BASELINE EXCERPT:
+{baseline_context}
 
-OUTPUT FORMAT (follow this EXACTLY):
-- **What they do**: 1-2 sentences on business model.
-- **Post-IPO**: 2 sentences on price action since listing.
-- **Targets**: Base $X / Bull $Y / Bear $Z — one line each with brief rationale.
-- **5x potential**: One sentence—realistic or not.
-- **Decision**: STRONG BUY / BUY / PASS — state entry price if buying.
-
-EXAMPLE OUTPUT (use this style):
-**What they do**: MDLN distributes medical supplies to hospitals/clinics with sticky relationships and recurring demand.
-
-**Post-IPO**: Up 52% since listing; strong momentum (+9% 1W) suggests buy-side confidence in the cash-flow story.
-
-**Targets**:
-- Base $58: Steady deleveraging + margin stability.
-- Bull $110: Above-trend growth + premium multiple.
-- Bear $28: Margin compression or execution slip.
-
-**5x potential**: Not realistic in 1-2 years without exceptional discontinuity.
-
-**Decision**: BUY — accumulate on pullbacks toward $40-42.
+Write exactly these six labeled sections, in this order:
+**Business / Value Proposition**: 3 compact sentences: product, customer/revenue model, differentiation or customer pull.
+**Current Setup**: 2 compact sentences: price action and what the tape/news imply.
+**Why It Could Work**: 2 semicolon-separated drivers with specific metrics, catalysts, or market-structure reasons.
+**What Can Go Wrong**: 2 semicolon-separated risks with concrete failure modes.
+**Scenario Targets**: Base, Bull, Bear in one paragraph; each scenario needs a target/framework plus 1-2 assumptions.
+**5x / Decision**: one paragraph with 5x realism, **Decision: STRONG BUY / BUY / PASS**, actionable entry level relative to current price, and sizing/risk note.
 
 RULES:
 - Do NOT say "Executive Summary" anywhere.
 - Do NOT use numbered sections (1), 2), 3)) — use bullets.
 - Do NOT use markdown headers (###).
-- Bold only key terms (ticker, prices, recommendation), not entire sentences.
+- Keep every scenario argued; never list Base/Bull/Bear without assumptions.
+- Do not use stale baseline prices as current entry levels.
+- Do not use "If you want" phrasing; write direct participation guidance instead.
 - Use markdown links [text](url) only when the URL is present in DATA, Recent news, or BASELINE.
-- Keep it under 250 words total."""
+- Target 325-450 words total."""
 
 
 def _build_upcoming_summary_prompt(
     identifier: str,
     baseline: str,
+    targets: Targets | None,
     expected_date: str | None,
     indicative_price: float | None,
     price_confidence: str | None,
 ) -> str:
     has_price = indicative_price is not None
     price_line = f"Indicative price: ${indicative_price:.2f} ({price_confidence} confidence)" if has_price else "Price: TBD (not yet disclosed)"
-    
-    decision_instruction = """- **Decision**: STRONG BUY / BUY / PASS — with participation price range.""" if has_price else """- **Decision**: Cannot recommend without price. State what valuation metrics to watch (e.g., "participate only if priced below X times revenue")."""
-    
-    return f"""Write a CONCISE preview for upcoming IPO: {identifier}.
+    targets_context = _format_targets_context(targets)
+    baseline_context = _clean_baseline_context(baseline)
+
+    return f"""Write a concise but substantive IPO preview for upcoming IPO: {identifier}.
+
+Use ONLY the provided data, target context, and cached baseline. Do not imply fresh web research.
+If date/pricing/prospectus details are uncertain, say exactly what must be confirmed. Prefer specific operating
+drivers over generic phrases. Current DATA overrides any older price/date/context in the baseline.
 
 DATA:
 - Expected date: {expected_date or "TBD"}
 - {price_line}
 
-BASELINE (for reference only—do NOT repeat):
-{baseline[:1500]}{"..." if len(baseline) > 1500 else ""}
+TARGET CONTEXT:
+{targets_context}
 
-FRESHNESS RULE:
-- Use only DATA and BASELINE above. Do not imply you searched for newer facts.
-- If the filing/date/pricing picture is incomplete, say what must be confirmed before participating.
+CACHED BASELINE EXCERPT:
+{baseline_context}
 
-OUTPUT FORMAT (follow this EXACTLY):
-- **What they do**: 1-2 sentences on business model.
-- **Bull/Bear**: Key upside case vs key risk (2-3 sentences total).
-- **Targets**: Base $X / Bull $Y / Bear $Z — or valuation framework if price unknown.
-- **5x potential**: One sentence.
-{decision_instruction}
-
-EXAMPLE OUTPUT (use this style for upcoming IPO WITH price):
-**What they do**: RIKU operates Japanese restaurants in the US with a scalable franchise model.
-
-**Bull/Bear**: Bull case is proven unit economics + expansion runway; bear case is restaurant execution risk and macro sensitivity.
-
-**Targets**:
-- Base $8: Steady store growth + margin stability.
-- Bull $18: Faster expansion + premium brand multiple.
-- Bear $3: Growth stalls or same-store declines.
-
-**5x potential**: Possible if expansion exceeds expectations, but not base case.
-
-**Decision**: BUY — participate at IPO price ($5) with small sizing; add on execution proof.
-
-EXAMPLE OUTPUT (use this style for upcoming IPO WITHOUT price):
-**What they do**: STUB operates a secondary ticketing marketplace monetizing via fees.
-
-**Bull/Bear**: Bull case is durable marketplace liquidity + operating leverage; bear case is fee regulation and event-cycle volatility.
-
-**Targets**: Use EV/Revenue framework—participate only if priced below 3-4x forward revenue.
-
-**5x potential**: Possible but requires multi-year category leadership proof.
-
-**Decision**: Cannot recommend without price. Participate only if IPO implies reasonable EV/Revenue vs marketplace comps.
+Write exactly these six labeled sections, in this order:
+**Business / Value Proposition**: 3 compact sentences: revenue model, customer/problem, competitive position, why public investors might care.
+**IPO Setup**: 2 compact sentences: timing/pricing confidence and what must be confirmed.
+**Bull Case**: 2 compact sentences with concrete drivers.
+**Bear Case**: 2 compact sentences with concrete risks.
+**Scenario Targets / Valuation**: Base, Bull, Bear in one paragraph; if price exists, use share targets, otherwise use valuation framework and assumptions.
+**5x / Decision**: one paragraph with 5x realism, **Decision: STRONG BUY / BUY / PASS** or **Cannot recommend without price**, participation conditions, and sizing/risk note.
 
 RULES:
 - Do NOT say "Executive Summary" anywhere.
 - Do NOT use numbered sections — use bullets.
 - Do NOT use markdown headers (###).
-- Bold only key terms, not entire sentences.
+- Keep every scenario argued; never list Base/Bull/Bear without assumptions.
+- Do not use stale baseline prices as current entry levels.
+- Do not use "If you want" phrasing; write direct participation guidance instead.
 - Use markdown links [text](url) only when the URL is present in DATA or BASELINE.
-- Keep it under 200 words total."""
+- Target 325-450 words total."""
 
 
 def _markdown_to_html(text: str) -> str:
@@ -629,7 +727,7 @@ def generate_recent_summary(
         prompt,
         task="recent_summary",
         label=identifier,
-        max_output_tokens=700,
+        max_output_tokens=1100,
     )
     summary = response.text.strip() or baseline
     save_update(thesis_dir, identifier, summary)
@@ -661,6 +759,7 @@ def generate_upcoming_summary(
     prompt = _build_upcoming_summary_prompt(
         identifier,
         baseline,
+        targets,
         expected_date,
         indicative_price,
         price_confidence,
@@ -671,7 +770,7 @@ def generate_upcoming_summary(
         prompt,
         task="upcoming_summary",
         label=identifier,
-        max_output_tokens=650,
+        max_output_tokens=1100,
     )
     summary = response.text.strip() or baseline
     save_update(thesis_dir, identifier, summary)

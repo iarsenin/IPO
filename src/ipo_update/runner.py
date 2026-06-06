@@ -35,11 +35,13 @@ from .performance import compute_ipo_performance
 from .thesis import (
     ThesisSummary,
     fetch_recent_news,
+    find_cached_identifier,
     generate_baseline,
     generate_recent_summary,
     generate_upcoming_summary,
     load_baseline,
     load_targets,
+    normalize_company_name,
 )
 
 
@@ -179,12 +181,16 @@ def main() -> None:
     # Remove upcoming IPOs whose ticker already appears in the recent list
     # (e.g. a company that just priced appears in both).
     recent_tickers = {ipo.ticker.upper() for ipo in recent_ipos if ipo.ticker}
-    recent_names = {ipo.name.lower().strip() for ipo in recent_ipos}
+    recent_names = {
+        normalized
+        for ipo in recent_ipos
+        if (normalized := normalize_company_name(ipo.name))
+    }
     before = len(upcoming_ipos)
     upcoming_ipos = [
         u for u in upcoming_ipos
         if not (u.ticker and u.ticker.upper() in recent_tickers)
-        and u.name.lower().strip() not in recent_names
+        and normalize_company_name(u.name) not in recent_names
     ]
     if len(upcoming_ipos) < before:
         logger.info(
@@ -234,11 +240,14 @@ def main() -> None:
         perf = compute_ipo_performance(ipo, series)
 
         identifier = ipo.ticker or ipo.name
+        cache_identifier = find_cached_identifier(thesis_dir, identifier, ipo.name) or identifier
+        if cache_identifier != identifier:
+            logger.info(f"Using cached thesis for {identifier} from {cache_identifier}")
         baseline = None
         targets = None
         if not args.skip_summaries:
-            baseline = load_baseline(thesis_dir, identifier)
-            targets = load_targets(thesis_dir, identifier)
+            baseline = load_baseline(thesis_dir, cache_identifier)
+            targets = load_targets(thesis_dir, cache_identifier)
             if not baseline:
                 try:
                     baseline, targets = generate_baseline(
@@ -278,7 +287,7 @@ def main() -> None:
         else:
             try:
                 summary = generate_recent_summary(
-                    identifier=identifier,
+                    identifier=cache_identifier,
                     baseline=baseline,
                     targets=targets,
                     client=client,
@@ -347,11 +356,14 @@ def main() -> None:
     for idx, upcoming in enumerate(upcoming_ipos, 1):
         logger.info(f"[{idx}/{total_upcoming}] Processing upcoming IPO: {upcoming.name} ({upcoming.ticker or 'no ticker'})")
         identifier = upcoming.ticker or upcoming.name
+        cache_identifier = find_cached_identifier(thesis_dir, identifier, upcoming.name) or identifier
+        if cache_identifier != identifier:
+            logger.info(f"Using cached thesis for {identifier} from {cache_identifier}")
         baseline = None
         targets = None
         if not args.skip_summaries:
-            baseline = load_baseline(thesis_dir, identifier)
-            targets = load_targets(thesis_dir, identifier)
+            baseline = load_baseline(thesis_dir, cache_identifier)
+            targets = load_targets(thesis_dir, cache_identifier)
             if not baseline:
                 try:
                     baseline, targets = generate_baseline(
@@ -379,7 +391,7 @@ def main() -> None:
         else:
             try:
                 summary = generate_upcoming_summary(
-                    identifier=identifier,
+                    identifier=cache_identifier,
                     baseline=baseline,
                     targets=targets,
                     client=client,
